@@ -1,0 +1,41 @@
+{
+  "project": "N2N-bootstrap NTN",
+  "paper": "Learning to Translate Noise for Robust Image Denoising, arXiv:2412.04727v2",
+  "variant": "No-GT adaptation: C_hat = N2N(I1); D' blind-Gaussian specialist over measured real-noise range",
+  "data": {
+    "intensity_transform": "log1p",
+    "intervals": [5, 7, 9],
+    "crop_size": 128,
+    "pseudo_clean_frames": 0,
+    "train_levels": [2, 3, 4],
+    "ood_test_level": 1,
+    "note": "log1p 域实测噪声 sigma_mad: level1=0.43, level2=0.21, level3=0.14, level4=0.10 (~1/N)"
+  },
+  "gaussian_expert": {
+    "sigma_min": 0.08,
+    "sigma_max": 0.6,
+    "bootstrap_checkpoint": "<N2N checkpoint>  # C_hat = N2N(I1) 作为 clean 目标",
+    "note": "盲高斯区间覆盖真实跨度且下界远离 0，堵死 T 学恒等映射",
+    "crop_size": 512,
+    "batch_size": 48,
+    "crop_batch_note": "与 N2N 对齐：同网络/同数据/同任务，BN 统计稳、用满 GPU",
+    "lr": 0.01
+  },
+  "translator": {
+    "width": 32,
+    "middle_blocks": 2,
+    "inject_sigma": 1.0,
+    "init_noise_scale": 0.1,
+    "implicit_target": "pseudo_clean",
+    "bootstrap_checkpoint": "<N2N checkpoint>  # 与 explicit 同锚 C_hat=N2N(I1)",
+    "alpha": 0.05,
+    "beta": 0.002,
+    "explicit_start_frac": 0.5,
+    "highpass_ratio": 0.0,
+    "crop_size": 512,
+    "batch_size": 12,
+    "crop_batch_note": "crop512 利于 explicit 分布统计；两张 A5000(24G) 实测 512/12 可跑（论文为 256/4）",
+    "lr_max": 0.001,
+    "lr_final": 0.00001
+  }
+}

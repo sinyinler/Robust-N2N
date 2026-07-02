@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+.venv/
+.uv-cache/
+
+results/checkpoints/**/*.pth
+results/checkpoints/**/*.pt
+results/images/*
+results/eval/*
+
+!results/checkpoints/.gitkeep
+!results/images/.gitkeep
+!results/eval/.gitkeep
+
+# PPT 中间渲染（可由 build_deck.py 重生成）
+ppt_assets/render/
+ppt_assets/page*.png
+
+# PowerPoint/Office 临时锁文件
+~$*
+
+ppt_assets/render_full/
