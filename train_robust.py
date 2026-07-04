@@ -135,7 +135,8 @@ def train(args) -> None:
 
             for k, v in logs.items():
                 running[k] = running.get(k, 0.0) + v
-            pbar.set_postfix({"loss": f"{logs['total']:.5f}", "white": "on" if use_white else "off",
+            pbar.set_postfix({"loss": f"{logs['total']:.5f}", "diff": f"{logs['diff']:.4f}",
+                              "white": "on" if use_white else "off",
                               "lr": f"{scheduler.get_last_lr()[0]:.2g}"})
 
         n = max(1, len(train_loader))
@@ -144,7 +145,7 @@ def train(args) -> None:
         state = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
         torch.save(state, save_path)
         print(f"[EPOCH {epoch}] " + " ".join(f"{k}={avg[k]:.5f}" for k in
-              ("total", "rec", "cons", "rtv", "white", "spatial", "freq") if k in avg)
+              ("total", "rec", "cons", "diff", "rtv", "white", "spatial", "freq") if k in avg)
               + f"  saved={save_path}")
 
 

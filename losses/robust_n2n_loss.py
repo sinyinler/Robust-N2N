@@ -44,7 +44,8 @@ class RobustN2NLoss(nn.Module):
     def forward(self, f_n1, n1, f_n2, n2, use_whitening: bool = False):
         """n1/n2：同场景两帧噪声图；f_n1=f(n1), f_n2=f(n2)。use_whitening：是否已过半、开白度项。"""
         rec = self.alpha * self.charb(f_n1, n2) + self.beta * self.charb(f_n2, n1)
-        cons = self.gamma * torch.mean(torch.abs(f_n1 - f_n2))
+        diff = torch.mean(torch.abs(f_n1 - f_n2))   # 未加权：塌缩诊断量，diff→0 表示输出与输入无关
+        cons = self.gamma * diff
         rtv = self.w_rtv * self.rtv(f_n1)
         total = rec + cons + rtv
 
@@ -60,6 +61,7 @@ class RobustN2NLoss(nn.Module):
             "total": float(total.detach()),
             "rec": float(rec.detach()),
             "cons": float(cons.detach()),
+            "diff": float(diff.detach()),
             "rtv": float(rtv.detach()),
             "white": float(white.detach()) if torch.is_tensor(white) else float(white),
             "spatial": float(spatial.detach()) if torch.is_tensor(spatial) else float(spatial),
