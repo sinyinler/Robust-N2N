@@ -42,3 +42,19 @@
 - 校验：三文件 py_compile 通过（本机无 torch，前向 smoke 需在服务器跑）。git commit dfd21f7。
 - 注意：对 n1/n2 各前向一次 → 显存约 2×，故 batch_size 默认降到 24（原 N2N 48），按显存再调。
 - 待办：服务器 smoke（确认前向/推理确定性/参数量）→ 整体训练 → 三组 OOD 评测回填结果。
+
+## 2026-07-04 结果（一）：一步法首训 → 模型塌缩成常数输出（失败）
+
+- 配置：全量 mix（发现 5914 batch/epoch），5 epoch，crop512/batch24，log1p，lr0.01，
+  α=β=1, γ=0.1, w_white=0.05(过半开), RTV=0.01, GIBlock inject_sigma=1.0。commit dfd21f7。
+- 推理(raw.npy vs reference.npy, dr=255)：**Robust-N2N 15.50 / 0.435 / r=−0.00**；
+  N2N(ours.npy) 33.92 / 0.877 / 0.901。→ Robust-N2N **r≈0 = 输出与内容无关**。
+- 训练日志铁证：epoch2 起 **cons=0、rtv=0、rec 卡在 2.298**（常数图的 Charbonnier 地板）
+  → 网络**无视输入、输出一张常数图**（经典 self-supervised collapse）。
+- 根因：**一致性项 γ|f(n1)−f(n2)| 的平凡最优解=常数**；GIBlock 训练注入又要求"对输入不变"
+  → 合力把模型推进常数陷阱。塌缩发生在 epoch2（白度 epoch3 才开）→ **白度不是元凶**。
+  （教训：DenoiseGAN 的一致性项靠对抗+cycle 防塌缩；我们纯 N2N+一致性没有保险，露出 collapse。）
+- 处置：① 损失加未加权诊断量 diff=mean|f(n1)−f(n2)|（γ=0 时也能看塌缩）；
+  ② 下一版**去掉一致性(γ=0)**、GIBlock 注入调小(inject_sigma=0.3)、保留白度，3 epoch 验；
+     N2N+RTV 已是验证过的好基线(=ours.npy 33.9dB)，不再重训对照。
+- 结果：下一版待回填。
