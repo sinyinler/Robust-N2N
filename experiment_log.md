@@ -98,4 +98,11 @@
   --feat_pred_hidden/--feat_w_out3/--feat_w_bridge；进度条/汇总打印 feat 与 std0/std1。
 - 校验：三文件 py_compile 通过（本机无 torch，前向 smoke 服务器跑）。
 - 预期：in-dist 大概率 ≈ N2N；价值(若有)在 OOD 编码器噪声不变性。仍需 OOD 数据 + raw.npy 分布归属。
-- 结果：待训练后回填（重点盯 std 别→0、细血管别被磨）。
+- 结果（v5，3 epoch，raw.npy vs reference.npy, dr=255）：**Robust-N2N 34.079 / 0.8785 / 0.9031
+  vs N2N 33.921 / 0.8768 / 0.9013 → 三项全胜 (+0.16dB / +0.0017 / +0.0018)**。
+  - **首个有效改动**：GIBlock 塌缩、白度更差，唯有特征一致性既不塌又略胜 N2N。
+  - 训练健康：rec 0.743→0.677→0.669（正常下降）；feat≈−1.43（贴权重和 −1.5，强对齐）。
+  - **警告：std1(bridge) 0.0814→0.0534→0.0375 持续下滑**（std0/out3 稳在 ~0.067）。没塌但在流失
+    多样性，训久/权重大可能塌。→ 后续考虑：降 feat_w_bridge、或给 bridge 上 EMA(BYOL)、或只在 out3 做。
+  - 局限：in-dist +0.16dB 幅度小；**价值仍需 OOD 验证**（raw.npy 分布归属 + mix 外 OOD 数据仍待提供）；
+    细血管是否被磨需看 quad 图。
