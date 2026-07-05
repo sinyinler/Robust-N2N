@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[0]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from models.robust_denoiser import RobustDenoiser
+from models.denoiser_feats import DenoiserWithFeats
 from utils.checkpoint import load_weights_flexible
 
 
@@ -96,7 +96,7 @@ def main(args):
     raw = load2d(args.raw)
     ref = load2d(args.reference)
 
-    model = RobustDenoiser(input_channels=1).to(device).eval()  # eval → GIBlock 注入关闭
+    model = DenoiserWithFeats(input_channels=1).to(device).eval()  # 无 GIBlock；推理只出去噪图
     print("[INFO] load:", load_weights_flexible(model, args.checkpoint, device))
     robust = infer(model, raw, device)
     np.save(out_dir / "robust_out.npy", robust)
