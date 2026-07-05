@@ -80,3 +80,22 @@
   OOD 数据 + raw.npy 分布归属仍待用户提供。
 - **下一方向（用户指定）**：删掉 GIBlock，改测 **JEPA / 跨视图特征一致性**（编码器多尺度特征上的
   自监督一致性，用 n1/n2 作两视图）。实现方案见项目讨论（先对齐后编码）。
+
+## 2026-07-05 落地跨视图特征一致性（SimSiam 式，删 GIBlock）
+
+用户拍板：深层 out3+bridge 两尺度、projector 用两层 1×1(BN+ReLU)、SimSiam(stop-grad+predictor,
+无EMA)、w_feat=0.1、深重浅轻。删掉 GIBlock。
+
+- 新增 `models/denoiser_feats.py`：`DenoiserWithFeats` = 原轻量 U-Net(无 GIBlock)，forward 可返回
+  编码器深层特征 [out3(64,@H/4), bridge(80,@H/8)]（浅层不返回，避免强制不变性磨细血管）。
+- 新增 `losses/feature_consistency.py`：`FeatureConsistencyLoss`（SimSiam 式，多尺度）：
+  每尺度 projector g(两层1×1+BN)、predictor h(1×1 bottleneck)，逐像素负余弦，
+  `0.5·D(h(g(f1)),sg(g(f2))) + 0.5·D(h(g(f2)),sg(g(f1)))`，深权重>浅权重。
+  防塌缩靠 **stop-gradient + predictor**（+重建损失拉住编码器）。附**塌缩监控**：归一化投影特征
+  逐维 std（健康≈1/√dim，塌→0），随训练打印。
+- `train_robust.py`：改用 DenoiserWithFeats（去 GIBlock），对 n1/n2 各 return_feats 前向，
+  总损失 = 对称N2N(Charbonnier) + RTV + w_feat·特征一致性；新增 --w_feat/--feat_dim/
+  --feat_pred_hidden/--feat_w_out3/--feat_w_bridge；进度条/汇总打印 feat 与 std0/std1。
+- 校验：三文件 py_compile 通过（本机无 torch，前向 smoke 服务器跑）。
+- 预期：in-dist 大概率 ≈ N2N；价值(若有)在 OOD 编码器噪声不变性。仍需 OOD 数据 + raw.npy 分布归属。
+- 结果：待训练后回填（重点盯 std 别→0、细血管别被磨）。

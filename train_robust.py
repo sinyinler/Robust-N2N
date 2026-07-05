@@ -20,8 +20,9 @@ from tqdm import tqdm
 
 # 复用 N2N 的数据加载 / 调度 / 随机种子（数据与配对口径完全一致）
 from train_n2n import build_loaders, set_seed, build_onecycle
-from models.robust_denoiser import RobustDenoiser
+from models.denoiser_feats import DenoiserWithFeats, FEAT_CHANNELS
 from losses.robust_n2n_loss import RobustN2NLoss
+from losses.feature_consistency import FeatureConsistencyLoss
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,8 +76,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rtv_weight", type=float, default=0.01, help="RTV 权重（建议对齐原 N2N 训练）")
     p.add_argument("--highpass_ratio", type=float, default=0.0)
     p.add_argument("--whiten_start_frac", type=float, default=0.5, help="训练进度过此比例后才开白度项")
-    p.add_argument("--inject_sigma", type=float, default=1.0, help="GIBlock 注入高斯基准强度（推理时关闭）")
-    p.add_argument("--init_noise_scale", type=float, default=0.1, help="GIBlock 注入可学习强度初值")
+    p.add_argument("--inject_sigma", type=float, default=1.0, help="[已弃用] GIBlock 注入，本分支不用")
+    p.add_argument("--init_noise_scale", type=float, default=0.1, help="[已弃用] GIBlock 注入，本分支不用")
+    # ---- 跨视图特征一致性（SimSiam 式，深层 out3+bridge）----
+    p.add_argument("--w_feat", type=float, default=0.1, help="跨视图特征一致性总权重")
+    p.add_argument("--feat_dim", type=int, default=128, help="projector 投影维度")
+    p.add_argument("--feat_pred_hidden", type=int, default=64, help="predictor bottleneck 维度")
+    p.add_argument("--feat_w_out3", type=float, default=0.5, help="out3(较浅)尺度权重(小)")
+    p.add_argument("--feat_w_bridge", type=float, default=1.0, help="bridge(最深)尺度权重(大)")
     args = p.parse_args()
     if args.data_index_min < 0:
         args.data_index_min = None
@@ -95,16 +102,20 @@ def train(args) -> None:
     os.makedirs(args.save_dir, exist_ok=True)
 
     _, train_loader, val_loader = build_loaders(args)
-    model = RobustDenoiser(input_channels=1, inject_sigma=args.inject_sigma,
-                           init_noise_scale=args.init_noise_scale).to(device)
+    model = DenoiserWithFeats(input_channels=1).to(device)   # 无 GIBlock
     if args.data_parallel and torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
 
     criterion = RobustN2NLoss(alpha=args.alpha, beta=args.beta, gamma=args.gamma,
                               w_white=args.w_white, beta_freq=args.beta_freq,
                               w_rtv=args.rtv_weight, highpass_ratio=args.highpass_ratio).to(device)
+    # 跨视图特征一致性（深层 out3+bridge，深重浅轻）；投影/预测头参数与主网络一起优化
+    criterion_feat = FeatureConsistencyLoss(
+        channels=FEAT_CHANNELS, dim=args.feat_dim, pred_hidden=args.feat_pred_hidden,
+        weights=[args.feat_w_out3, args.feat_w_bridge]).to(device)
 
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr_max, weight_decay=1e-4)
+    optimizer = optim.AdamW(list(model.parameters()) + list(criterion_feat.parameters()),
+                            lr=args.lr_max, weight_decay=1e-4)
     scheduler = build_onecycle(optimizer, len(train_loader), args)
 
     total_steps = args.epochs * len(train_loader)
@@ -114,29 +125,35 @@ def train(args) -> None:
 
     global_step = 0
     for epoch in range(1, args.epochs + 1):
-        model.train()  # GIBlock 注入在训练模式下生效
+        model.train(); criterion_feat.train()   # 含投影/预测头的 BN
         running = {}
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}")
         for n1, n2 in pbar:
             n1 = n1.to(device, non_blocking=True)
             n2 = n2.to(device, non_blocking=True)
-            f_n1 = model(n1)
-            f_n2 = model(n2)
+            f_n1, feats1 = model(n1, return_feats=True)
+            f_n2, feats2 = model(n2, return_feats=True)
             use_white = global_step >= whiten_start
             loss, logs = criterion(f_n1, n1, f_n2, n2, use_whitening=use_white)
+            feat_loss, feat_stds = criterion_feat(feats1, feats2)   # 跨视图特征一致性
+            loss = loss + args.w_feat * feat_loss
+            logs["feat"] = float(feat_loss.detach())
+            for si, s in enumerate(feat_stds):
+                logs[f"std{si}"] = s
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                torch.nn.utils.clip_grad_norm_(
+                    list(model.parameters()) + list(criterion_feat.parameters()), args.grad_clip)
             optimizer.step()
             scheduler.step()
             global_step += 1
 
             for k, v in logs.items():
                 running[k] = running.get(k, 0.0) + v
-            pbar.set_postfix({"loss": f"{logs['total']:.5f}", "diff": f"{logs['diff']:.4f}",
-                              "white": "on" if use_white else "off",
+            pbar.set_postfix({"loss": f"{float(loss.detach()):.5f}", "feat": f"{logs['feat']:.4f}",
+                              "std": "/".join(f"{s:.3f}" for s in feat_stds),
                               "lr": f"{scheduler.get_last_lr()[0]:.2g}"})
 
         n = max(1, len(train_loader))
@@ -145,7 +162,7 @@ def train(args) -> None:
         state = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
         torch.save(state, save_path)
         print(f"[EPOCH {epoch}] " + " ".join(f"{k}={avg[k]:.5f}" for k in
-              ("total", "rec", "cons", "diff", "rtv", "white", "spatial", "freq") if k in avg)
+              ("total", "rec", "diff", "rtv", "feat", "std0", "std1", "white") if k in avg)
               + f"  saved={save_path}")
 
 
