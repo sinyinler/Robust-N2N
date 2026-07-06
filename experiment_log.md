@@ -106,3 +106,16 @@
     多样性，训久/权重大可能塌。→ 后续考虑：降 feat_w_bridge、或给 bridge 上 EMA(BYOL)、或只在 out3 做。
   - 局限：in-dist +0.16dB 幅度小；**价值仍需 OOD 验证**（raw.npy 分布归属 + mix 外 OOD 数据仍待提供）；
     细血管是否被磨需看 quad 图。
+
+## 2026-07-06 改动：特征一致性 SimSiam → 1×1 卷积 + Charbonnier（v6，用户指定）
+
+- 用户要求：out3/bridge 改用**单个 1×1 卷积**提取特征、跨视图损失改为 Charbonnier 差；输出层用三项
+  [f(n1)−f(n2)]+[f(n1)−n2]+[f(n2)−n1]（= 对称N2N Charbonnier + 一致性γ）；总损失=charbonnier+rtv+特征损失。
+- 实现：
+  - `losses/feature_consistency.py`：改为每尺度一个 Conv1×1(C→dim)，
+    L_feat = Σ_s w_s·Charbonnier(φ_s(feat_n1), φ_s(feat_n2))。**去掉 projector/predictor/stop-grad/负余弦**。
+  - `train_robust.py`：criterion_feat 去 pred_hidden；一致性项 γ 通过 --gamma 打开（默认0.1）。
+  - 总损失 = α·Charb(f(n1),n2)+β·Charb(f(n2),n1)+γ·|f(n1)−f(n2)| + λ_rtv·RTV + w_feat·L_feat。
+- ⚠ 塌缩风险：同时"去掉 SimSiam 防塌机制"+"打开 γ 一致性" = 两个塌缩驱动。保留 std/diff 监控，盯早停。
+- 也新增 eval_ood_robust.py（N2N vs Robust-N2N，level1 OOD 对照）。
+- 结果：待训练后回填。
