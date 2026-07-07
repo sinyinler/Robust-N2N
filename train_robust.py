@@ -84,7 +84,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--feat_pred_hidden", type=int, default=64, help="predictor bottleneck 维度")
     p.add_argument("--feat_w_out3", type=float, default=0.5, help="out3(较浅)尺度权重(小)")
     p.add_argument("--feat_w_bridge", type=float, default=1.0, help="bridge(最深)尺度权重(大)")
-    p.add_argument("--feat_use_proj", type=int, default=1, help="1=带 1×1 projector；0=直接用编码器特征当 z")
+    p.add_argument("--feat_use_proj", type=int, default=1, help="1=带 projector；0=直接用编码器特征当 z")
+    p.add_argument("--feat_scales", type=str, nargs="*", default=["out3", "bridge"],
+                   choices=["out3", "bridge"], help="在哪些深度加 projector 算一致性：out3=encoder3, bridge=bottleneck")
     args = p.parse_args()
     if args.data_index_min < 0:
         args.data_index_min = None
@@ -110,10 +112,16 @@ def train(args) -> None:
     criterion = RobustN2NLoss(alpha=args.alpha, beta=args.beta, gamma=args.gamma,
                               w_white=args.w_white, beta_freq=args.beta_freq,
                               w_rtv=args.rtv_weight, highpass_ratio=args.highpass_ratio).to(device)
-    # 跨视图特征一致性（深层 out3+bridge，深重浅轻）；投影/预测头参数与主网络一起优化
+    # 跨视图特征一致性：按 --feat_scales 选深度（out3=encoder3@idx0, bridge=bottleneck@idx1）
+    _scale_info = {"out3": (0, FEAT_CHANNELS[0], args.feat_w_out3),
+                   "bridge": (1, FEAT_CHANNELS[1], args.feat_w_bridge)}
+    feat_idx = [_scale_info[s][0] for s in args.feat_scales]          # 从 model 返回的 [out3,bridge] 里取哪些
+    feat_ch = [_scale_info[s][1] for s in args.feat_scales]
+    feat_w = [_scale_info[s][2] for s in args.feat_scales]
+    print(f"[INFO] feature consistency scales={args.feat_scales} (idx={feat_idx}, ch={feat_ch}, w={feat_w})")
     criterion_feat = FeatureConsistencyLoss(
-        channels=FEAT_CHANNELS, dim=args.feat_dim, pred_hidden=args.feat_pred_hidden,
-        weights=[args.feat_w_out3, args.feat_w_bridge], use_proj=bool(args.feat_use_proj)).to(device)
+        channels=feat_ch, dim=args.feat_dim, pred_hidden=args.feat_pred_hidden,
+        weights=feat_w, use_proj=bool(args.feat_use_proj)).to(device)
 
     optimizer = optim.AdamW(list(model.parameters()) + list(criterion_feat.parameters()),
                             lr=args.lr_max, weight_decay=1e-4)
@@ -136,7 +144,9 @@ def train(args) -> None:
             f_n2, feats2 = model(n2, return_feats=True)
             use_white = global_step >= whiten_start
             loss, logs = criterion(f_n1, n1, f_n2, n2, use_whitening=use_white)
-            feat_loss, feat_stds = criterion_feat(feats1, feats2)   # 跨视图特征一致性
+            feats1_sel = [feats1[i] for i in feat_idx]              # 按 --feat_scales 选深度
+            feats2_sel = [feats2[i] for i in feat_idx]
+            feat_loss, feat_stds = criterion_feat(feats1_sel, feats2_sel)   # 跨视图特征一致性
             loss = loss + args.w_feat * feat_loss
             logs["feat"] = float(feat_loss.detach())
             for si, s in enumerate(feat_stds):
