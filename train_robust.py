@@ -111,7 +111,7 @@ def train(args) -> None:
                               w_rtv=args.rtv_weight, highpass_ratio=args.highpass_ratio).to(device)
     # 跨视图特征一致性（深层 out3+bridge，深重浅轻）；投影/预测头参数与主网络一起优化
     criterion_feat = FeatureConsistencyLoss(
-        channels=FEAT_CHANNELS, dim=args.feat_dim, pred_hidden=args.feat_pred_hidden,
+        channels=FEAT_CHANNELS, dim=args.feat_dim,
         weights=[args.feat_w_out3, args.feat_w_bridge]).to(device)
 
     optimizer = optim.AdamW(list(model.parameters()) + list(criterion_feat.parameters()),
