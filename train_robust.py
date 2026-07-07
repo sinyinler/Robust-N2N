@@ -84,6 +84,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--feat_pred_hidden", type=int, default=64, help="predictor bottleneck 维度")
     p.add_argument("--feat_w_out3", type=float, default=0.5, help="out3(较浅)尺度权重(小)")
     p.add_argument("--feat_w_bridge", type=float, default=1.0, help="bridge(最深)尺度权重(大)")
+    p.add_argument("--feat_use_proj", type=int, default=1, help="1=带 1×1 projector；0=直接用编码器特征当 z")
     args = p.parse_args()
     if args.data_index_min < 0:
         args.data_index_min = None
@@ -112,7 +113,7 @@ def train(args) -> None:
     # 跨视图特征一致性（深层 out3+bridge，深重浅轻）；投影/预测头参数与主网络一起优化
     criterion_feat = FeatureConsistencyLoss(
         channels=FEAT_CHANNELS, dim=args.feat_dim, pred_hidden=args.feat_pred_hidden,
-        weights=[args.feat_w_out3, args.feat_w_bridge]).to(device)
+        weights=[args.feat_w_out3, args.feat_w_bridge], use_proj=bool(args.feat_use_proj)).to(device)
 
     optimizer = optim.AdamW(list(model.parameters()) + list(criterion_feat.parameters()),
                             lr=args.lr_max, weight_decay=1e-4)
