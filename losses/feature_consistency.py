@@ -2,7 +2,7 @@
 """跨视图特征一致性（SimSiam 式：projector(可选) + predictor + 归一化对称负余弦 + stop-grad）。
 
 对 out3、bridge：
-  use_proj=1: z = φ_s(feat)（单个 1×1 卷积 projector，通道→dim）;  p = h_s(z)
+  use_proj=1: z = g_s(feat)（SimSiam 论文式 3 层 MLP projector，每层 BN、末层无 ReLU）;  p = h_s(z)
   use_proj=0: z = feat（直接用编码器特征、不加 projector，通道=原特征通道）; p = h_s(z)
   L_s = 0.5·(−cos(p1, sg·z2)) + 0.5·(−cos(p2, sg·z1))          # 归一化后逐像素余弦
   L_feat = Σ_s w_s · L_s
@@ -20,8 +20,22 @@ from torch import nn
 import torch.nn.functional as F
 
 
+class ProjHead(nn.Module):
+    """projector g：SimSiam 式 3 层 MLP（每层带 BN；隐藏层有 ReLU，末层有 BN 无 ReLU）。1×1 卷积实现。"""
+    def __init__(self, in_dim: int, dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_dim, dim, 1, bias=False), nn.BatchNorm2d(dim), nn.ReLU(inplace=True),
+            nn.Conv2d(dim, dim, 1, bias=False), nn.BatchNorm2d(dim), nn.ReLU(inplace=True),
+            nn.Conv2d(dim, dim, 1, bias=False), nn.BatchNorm2d(dim),          # 末层：有 BN、无 ReLU
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
 class PredHead(nn.Module):
-    """predictor h：1×1 bottleneck MLP（防塌缩必需件）。"""
+    """predictor h：SimSiam 式 2 层 bottleneck MLP（隐藏层 BN+ReLU，输出层无 BN 无 ReLU）。防塌缩必需件。"""
     def __init__(self, dim: int, hidden: int):
         super().__init__()
         self.net = nn.Sequential(
@@ -38,7 +52,7 @@ class FeatureConsistencyLoss(nn.Module):
         super().__init__()
         self.use_proj = bool(use_proj)
         if self.use_proj:
-            self.projs = nn.ModuleList([nn.Conv2d(c, dim, kernel_size=1, bias=False) for c in channels])
+            self.projs = nn.ModuleList([ProjHead(c, dim) for c in channels])   # SimSiam 3 层 MLP projector
             pred_dims = [dim for _ in channels]                 # predictor 作用在投影后的 dim 上
         else:
             self.projs = None
