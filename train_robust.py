@@ -82,11 +82,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--w_feat", type=float, default=0.1, help="跨视图特征一致性总权重")
     p.add_argument("--feat_dim", type=int, default=128, help="projector 投影维度")
     p.add_argument("--feat_pred_hidden", type=int, default=64, help="predictor bottleneck 维度")
-    p.add_argument("--feat_w_out3", type=float, default=0.5, help="out3(较浅)尺度权重(小)")
-    p.add_argument("--feat_w_bridge", type=float, default=1.0, help="bridge(最深)尺度权重(大)")
     p.add_argument("--feat_use_proj", type=int, default=1, help="1=带 projector；0=直接用编码器特征当 z")
-    p.add_argument("--feat_scales", type=str, nargs="*", default=["out3", "bridge"],
-                   choices=["out3", "bridge"], help="在哪些深度加 projector 算一致性：out3=encoder3, bridge=bottleneck")
+    p.add_argument("--feat_scales", type=str, nargs="*", default=["encoder3", "bottleneck"],
+                   choices=["encoder1", "encoder2", "encoder3", "out3", "bottleneck", "bridge"],
+                   help="在哪些深度加 projector 算一致性（浅→深）。out3=encoder3, bridge=bottleneck 为别名")
+    p.add_argument("--feat_weights", type=float, nargs="*", default=None,
+                   help="各尺度权重，长度须与 --feat_scales 一致；不给则用默认(enc1:0.1,enc2:0.2,enc3:0.5,bn:1.0)")
     args = p.parse_args()
     if args.data_index_min < 0:
         args.data_index_min = None
@@ -112,12 +113,22 @@ def train(args) -> None:
     criterion = RobustN2NLoss(alpha=args.alpha, beta=args.beta, gamma=args.gamma,
                               w_white=args.w_white, beta_freq=args.beta_freq,
                               w_rtv=args.rtv_weight, highpass_ratio=args.highpass_ratio).to(device)
-    # 跨视图特征一致性：按 --feat_scales 选深度（out3=encoder3@idx0, bridge=bottleneck@idx1）
-    _scale_info = {"out3": (0, FEAT_CHANNELS[0], args.feat_w_out3),
-                   "bridge": (1, FEAT_CHANNELS[1], args.feat_w_bridge)}
-    feat_idx = [_scale_info[s][0] for s in args.feat_scales]          # 从 model 返回的 [out3,bridge] 里取哪些
+    # 跨视图特征一致性：按 --feat_scales 选深度。model 返回 [enc1,enc2,enc3,bottleneck]=idx 0..3
+    # 每项：(feat 索引, 通道数, 默认权重)；out3/bridge 为 encoder3/bottleneck 的别名
+    _scale_info = {
+        "encoder1": (0, FEAT_CHANNELS[0], 0.1),
+        "encoder2": (1, FEAT_CHANNELS[1], 0.2),
+        "encoder3": (2, FEAT_CHANNELS[2], 0.5), "out3": (2, FEAT_CHANNELS[2], 0.5),
+        "bottleneck": (3, FEAT_CHANNELS[3], 1.0), "bridge": (3, FEAT_CHANNELS[3], 1.0),
+    }
+    feat_idx = [_scale_info[s][0] for s in args.feat_scales]          # 从 model 返回的 4 尺度里取哪些
     feat_ch = [_scale_info[s][1] for s in args.feat_scales]
-    feat_w = [_scale_info[s][2] for s in args.feat_scales]
+    if args.feat_weights is not None:
+        if len(args.feat_weights) != len(args.feat_scales):
+            raise ValueError(f"--feat_weights({len(args.feat_weights)}) 长度须等于 --feat_scales({len(args.feat_scales)})")
+        feat_w = list(args.feat_weights)
+    else:
+        feat_w = [_scale_info[s][2] for s in args.feat_scales]        # 默认权重
     print(f"[INFO] feature consistency scales={args.feat_scales} (idx={feat_idx}, ch={feat_ch}, w={feat_w})")
     criterion_feat = FeatureConsistencyLoss(
         channels=feat_ch, dim=args.feat_dim, pred_hidden=args.feat_pred_hidden,
@@ -173,7 +184,7 @@ def train(args) -> None:
         state = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
         torch.save(state, save_path)
         print(f"[EPOCH {epoch}] " + " ".join(f"{k}={avg[k]:.5f}" for k in
-              ("total", "rec", "diff", "rtv", "feat", "std0", "std1", "white") if k in avg)
+              ("total", "rec", "diff", "rtv", "feat", "std0", "std1", "std2", "std3", "white") if k in avg)
               + f"  saved={save_path}")
 
 
