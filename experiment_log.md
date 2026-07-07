@@ -119,3 +119,12 @@
 - ⚠ 塌缩风险：同时"去掉 SimSiam 防塌机制"+"打开 γ 一致性" = 两个塌缩驱动。保留 std/diff 监控，盯早停。
 - 也新增 eval_ood_robust.py（N2N vs Robust-N2N，level1 OOD 对照）。
 - 结果：待训练后回填。
+
+## 2026-07-06 修正特征损失（选项 A：归一化+stop-grad，解决量级问题）
+
+- 诊断：v6（1×1+Charbonnier）特征损失量级 ~1e-3，w_feat=0.1 → 贡献 ~1e-4，**基本不起作用**；
+  且 v6 在 raw.npy(5x5 OOD) 上 33.08 < v5(mix)34.08，但 v5 是 mix 训、可能见过 5x5，非公平基线。
+- 改动 `losses/feature_consistency.py`（选项 A）：1×1 卷积提特征后 **L2 归一化 + 对称负余弦 + stop-grad**
+  （单 1×1 卷积、无 predictor）。→ 尺度无关(∈[−1,1])，w_feat=0.1 生效；stop-grad 防塌。
+- 公平评测：改用 eval_ood_robust.py 在 5x5 level1 OOD 上比 N2N(lv234)，不再用 raw.npy 单图。
+- 结果：待 v7 训练回填。
