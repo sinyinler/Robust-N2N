@@ -48,20 +48,21 @@ class PredHead(nn.Module):
 
 
 class FeatureConsistencyLoss(nn.Module):
-    def __init__(self, channels, dim: int = 128, pred_hidden: int = 64, weights=None, use_proj: bool = True):
+    def __init__(self, channels, dim: int = 128, pred_hidden=None, weights=None, use_proj: bool = True):
         super().__init__()
         self.use_proj = bool(use_proj)
-        # dim<=0（或 None）: 每个尺度用原生通道 C（projector C→C→C，predictor 瓶颈按 C//4 缩放）
+        # dim<=0（或 None）: 每个尺度用原生通道 C（projector C→C→C）
         native = self.use_proj and ((dim is None) or (int(dim) <= 0))
         if self.use_proj:
             self.proj_dims = [c if native else int(dim) for c in channels]      # 各尺度投影维度
             self.projs = nn.ModuleList([ProjHead(c, d) for c, d in zip(channels, self.proj_dims)])
-            pred_hiddens = [max(4, d // 4) if native else pred_hidden for d in self.proj_dims]
         else:
             self.projs = None
             self.proj_dims = list(channels)                     # 无 projector：z=原生特征
-            pred_hiddens = [pred_hidden for _ in channels]
-        self.preds = nn.ModuleList([PredHead(d, h) for d, h in zip(self.proj_dims, pred_hiddens)])
+        # predictor 瓶颈：不显式指定则自动取 dim//4（SimSiam 论文推荐比例；=dim 会不稳/失败）
+        auto_h = (pred_hidden is None) or (int(pred_hidden) <= 0)
+        self.pred_hiddens = [max(4, d // 4) if auto_h else int(pred_hidden) for d in self.proj_dims]
+        self.preds = nn.ModuleList([PredHead(d, h) for d, h in zip(self.proj_dims, self.pred_hiddens)])
         self.weights = list(weights) if weights is not None else [1.0] * len(channels)
 
     @staticmethod
