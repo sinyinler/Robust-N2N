@@ -53,6 +53,30 @@ def std_target(scale: str, args) -> float:
     return dim ** -0.5
 
 
+def parse_eval(out: str):
+    """解析 infer_eval_robust.py 的指标表，取 Robust-N2N 与 N2N (ours) 两行。"""
+    def row(tag):
+        m = re.search(rf"^\s*{tag}\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)", out, re.M)
+        return dict(zip(("psnr", "mssim", "r"), map(float, m.groups()))) if m else None
+    return row(r"Robust-N2N"), row(r"N2N \(ours\)")
+
+
+def run_eval(ckpt: str, name: str, args):
+    """对该臂的 checkpoint 跑单图推理评测，返回 (robust指标, n2n基线指标)。"""
+    out_dir = os.path.join(args.root, "infer", name)
+    cmd = [sys.executable, "infer_eval_robust.py", "--checkpoint", ckpt,
+           "--raw", args.raw, "--reference", args.reference, "--out_dir", out_dir]
+    if args.n2n:
+        cmd += ["--n2n", args.n2n]
+    ret = subprocess.run(cmd, capture_output=True, text=True)
+    with open(os.path.join(args.root, "logs", f"{name}.eval.log"), "w") as f:
+        f.write(ret.stdout + ret.stderr)
+    if ret.returncode != 0:
+        print(f"[FAIL eval] 退出码 {ret.returncode}，看 {name}.eval.log")
+        return None, None
+    return parse_eval(ret.stdout)
+
+
 def parse_log(path: str):
     """取日志里最后一行 [EPOCH n] ...，解析成 {metric: value}。"""
     if not os.path.exists(path):
@@ -84,6 +108,11 @@ def main():
     p.add_argument("--feat_use_proj", type=int, default=0)
     p.add_argument("--feat_dim", type=int, default=128, help="feat_use_proj=1 时生效；0=原生通道")
     p.add_argument("--seed", type=int, default=42)
+    # ---- 每条臂训完自动跑单图评测（infer_eval_robust.py）----
+    p.add_argument("--eval", type=int, default=1, help="1=每条臂训完自动评测并收指标")
+    p.add_argument("--raw", type=str, default="/home/songyd/Projects/Robust-N2N/raw.npy")
+    p.add_argument("--reference", type=str, default="/home/songyd/Projects/Robust-N2N/reference.npy")
+    p.add_argument("--n2n", type=str, default="/home/songyd/Projects/Robust-N2N/ours.npy", help="N2N 基线结果；空则不比")
     # ---- sweep 本身 ----
     p.add_argument("--root", type=str, default="results/sweep")
     p.add_argument("--force", action="store_true", help="已有 checkpoint 也重跑")
@@ -95,7 +124,7 @@ def main():
     os.makedirs(ck_root, exist_ok=True)
     os.makedirs(log_root, exist_ok=True)
 
-    results = []
+    results, n2n_base = [], None
     for i, (w_feat, sel) in enumerate(arms, 1):
         name = arm_name(w_feat, sel)
         save_dir = os.path.join(ck_root, name)
@@ -125,30 +154,48 @@ def main():
                 ret = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT)
             if ret.returncode != 0:
                 print(f"[FAIL] 退出码 {ret.returncode}，看 {log_path}")
-                results.append((name, w_feat, sel, None)); continue
-        results.append((name, w_feat, sel, parse_log(log_path)))
+                results.append((name, w_feat, sel, None, None)); continue
+
+        ev = None
+        if args.eval and os.path.exists(ckpt):
+            ev, base = run_eval(ckpt, name, args)
+            if base and n2n_base is None:
+                n2n_base = base                          # N2N 基线各臂相同，记一次即可
+            if ev:
+                print(f"  PSNR={ev['psnr']:.3f}  MSSIM={ev['mssim']:.4f}  r={ev['r']:.4f}")
+        results.append((name, w_feat, sel, parse_log(log_path), ev))
 
     if args.dry_run:
         return
 
     # ---- 汇总表 ----
+    base_psnr = n2n_base["psnr"] if n2n_base else None
     lines = ["# 特征一致性权重 sweep 汇总", "",
              f"共用配置: levels={args.levels} epochs={args.epochs} batch={args.batch_size} lr={args.lr} "
-             f"rtv={args.rtv_weight} gamma={args.gamma} feat_use_proj={args.feat_use_proj} seed={args.seed}", "",
-             "`std` 括号内为健康值 ≈1/√dim；往 0 掉 = 塌缩。`rec` 越低越好，`feat` 越负说明特征越对齐。", "",
-             "| 臂 | w_feat | 尺度(权重) | rec | diff | feat | " + " | ".join(f"std[{SHORT[s]}]" for s in SCALES) + " |",
-             "|---|---|---|---|---|---|" + "---|" * len(SCALES)]
-    for name, w_feat, sel, m in results:
+             f"rtv={args.rtv_weight} gamma={args.gamma} feat_use_proj={args.feat_use_proj} seed={args.seed}", ""]
+    if n2n_base:
+        lines += [f"**N2N 基线**（{os.path.basename(args.n2n)}）: PSNR={n2n_base['psnr']:.3f}  "
+                  f"MSSIM={n2n_base['mssim']:.4f}  r={n2n_base['r']:.4f} —— ΔPSNR>0 才算赢过 N2N。", ""]
+    lines += ["`std` 括号内为健康值 ≈1/√dim；往 0 掉 = 塌缩。`rec` 越低越好，`feat` 越负说明特征越对齐。", "",
+              "| 臂 | w_feat | 尺度(权重) | PSNR | ΔPSNR | MSSIM | r | rec | diff | feat | "
+              + " | ".join(f"std[{SHORT[s]}]" for s in SCALES) + " |",
+              "|---|---|---|---|---|---|---|---|---|---|" + "---|" * len(SCALES)]
+    for name, w_feat, sel, m, ev in results:
         scales_txt = ", ".join(f"{SHORT[s]}={w:g}" for s, w in sel)
         if m is None:
-            lines.append(f"| {name} | {w_feat:g} | {scales_txt} | 失败 | - | - |" + " - |" * len(SCALES)); continue
+            lines.append(f"| {name} | {w_feat:g} | {scales_txt} | 失败 |" + " - |" * (6 + len(SCALES))); continue
+        if ev:
+            d = f"{ev['psnr'] - base_psnr:+.3f}" if base_psnr else "-"
+            ev_txt = f"{ev['psnr']:.3f} | {d} | {ev['mssim']:.4f} | {ev['r']:.4f}"
+        else:
+            ev_txt = "- | - | - | -"
         # std{i} 按 feat_scales 的顺序对应 sel[i]，映射回尺度名
         std_by_scale = {s: m.get(f"std{i}") for i, (s, _) in enumerate(sel)}
         cells = []
         for s in SCALES:
             v = std_by_scale.get(s)
             cells.append("-" if v is None else f"{v:.3f} ({std_target(s, args):.3f})")
-        lines.append(f"| {name} | {w_feat:g} | {scales_txt} | {m.get('rec', float('nan')):.5f} | "
+        lines.append(f"| {name} | {w_feat:g} | {scales_txt} | {ev_txt} | {m.get('rec', float('nan')):.5f} | "
                      f"{m.get('diff', float('nan')):.5f} | {m.get('feat', float('nan')):.4f} | " + " | ".join(cells) + " |")
 
     out = os.path.join(args.root, "summary.md")
