@@ -82,7 +82,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--init_noise_scale", type=float, default=0.1, help="[已弃用] GIBlock 注入，本分支不用")
     # ---- 跨视图特征一致性（SimSiam 式，深层 out3+bridge）----
     p.add_argument("--w_feat", type=float, default=0.1, help="跨视图特征一致性总权重")
-    p.add_argument("--feat_dim", type=int, default=128, help="projector 投影维度")
+    p.add_argument("--feat_dim", type=int, default=128, help="projector 投影维度；0=各尺度用原生通道(C→C)")
     p.add_argument("--feat_pred_hidden", type=int, default=64, help="predictor bottleneck 维度")
     p.add_argument("--feat_use_proj", type=int, default=1, help="1=带 projector；0=直接用编码器特征当 z")
     p.add_argument("--feat_scales", type=str, nargs="*", default=["encoder3", "bottleneck"],
@@ -138,6 +138,9 @@ def train(args) -> None:
     criterion_feat = FeatureConsistencyLoss(
         channels=feat_ch, dim=args.feat_dim, pred_hidden=args.feat_pred_hidden,
         weights=feat_w, use_proj=bool(args.feat_use_proj)).to(device)
+    print(f"[INFO] feat projection dims={criterion_feat.proj_dims} "
+          f"(feat_dim={args.feat_dim}{' → 原生通道' if args.feat_dim <= 0 else ''}); "
+          f"std 健康值≈1/√dim={[round(d**-0.5, 3) for d in criterion_feat.proj_dims]}")
 
     optimizer = optim.AdamW(list(model.parameters()) + list(criterion_feat.parameters()),
                             lr=args.lr_max, weight_decay=1e-4)
