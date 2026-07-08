@@ -71,6 +71,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--alpha", type=float, default=1.0, help="N2N 正向 Charbonnier 权重")
     p.add_argument("--beta", type=float, default=1.0, help="N2N 反向 Charbonnier 权重")
     p.add_argument("--gamma", type=float, default=0.1, help="一致性 |f(n1)-f(n2)| 权重")
+    p.add_argument("--pixel_target", choices=["n2n", "self"], default="n2n",
+                   help="像素靶：n2n=对称N2N(拿兄弟帧当靶)；self=自重建 f(n1)->n1(恒等靶,对照实验)")
     p.add_argument("--w_white", type=float, default=0.05, help="残差白度总权重（小）")
     p.add_argument("--beta_freq", type=float, default=2e-3, help="白度内部 freq 相对 spatial 的权重")
     p.add_argument("--rtv_weight", type=float, default=0.01, help="RTV 权重（建议对齐原 N2N 训练）")
@@ -112,7 +114,10 @@ def train(args) -> None:
 
     criterion = RobustN2NLoss(alpha=args.alpha, beta=args.beta, gamma=args.gamma,
                               w_white=args.w_white, beta_freq=args.beta_freq,
-                              w_rtv=args.rtv_weight, highpass_ratio=args.highpass_ratio).to(device)
+                              w_rtv=args.rtv_weight, highpass_ratio=args.highpass_ratio,
+                              self_target=(args.pixel_target == "self")).to(device)
+    print(f"[INFO] pixel_target={args.pixel_target}"
+          + ("  (自重建恒等靶：预期几乎不去噪，仅作对照)" if args.pixel_target == "self" else ""))
     # 跨视图特征一致性：按 --feat_scales 选深度。model 返回 [enc1,enc2,enc3,bottleneck]=idx 0..3
     # 每项：(feat 索引, 通道数, 默认权重)；out3/bridge 为 encoder3/bottleneck 的别名
     _scale_info = {

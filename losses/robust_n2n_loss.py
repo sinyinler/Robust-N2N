@@ -33,8 +33,11 @@ class RobustN2NLoss(nn.Module):
         rtv_radius: int = 2,
         rtv_sigma: float = 2.0,
         highpass_ratio: float = 0.0,
+        self_target: bool = False,
     ):
         super().__init__()
+        # self_target=True: 像素靶换成自重建 f(n1)->n1 / f(n2)->n2（恒等靶，并去掉一致性项），仅供对照实验
+        self.self_target = bool(self_target)
         self.alpha, self.beta, self.gamma = float(alpha), float(beta), float(gamma)
         self.w_white, self.w_rtv = float(w_white), float(w_rtv)
         self.charb = CharbonnierLoss(eps=charb_eps)
@@ -43,9 +46,13 @@ class RobustN2NLoss(nn.Module):
 
     def forward(self, f_n1, n1, f_n2, n2, use_whitening: bool = False):
         """n1/n2：同场景两帧噪声图；f_n1=f(n1), f_n2=f(n2)。use_whitening：是否已过半、开白度项。"""
-        rec = self.alpha * self.charb(f_n1, n2) + self.beta * self.charb(f_n2, n1)
+        if self.self_target:                        # 对照实验：自重建恒等靶，去掉一致性项
+            rec = self.alpha * self.charb(f_n1, n1) + self.beta * self.charb(f_n2, n2)
+            cons = torch.zeros((), device=f_n1.device, dtype=f_n1.dtype)
+        else:                                        # 默认：对称 N2N（拿兄弟帧当靶）
+            rec = self.alpha * self.charb(f_n1, n2) + self.beta * self.charb(f_n2, n1)
+            cons = self.gamma * self.charb(f_n1, f_n2)  # 一致性项：γ·Charbonnier(f(n1), f(n2))
         diff = torch.mean(torch.abs(f_n1 - f_n2))   # 未加权 L1：仅作塌缩诊断量，diff→0 表示输出塌成常数
-        cons = self.gamma * self.charb(f_n1, f_n2)  # 一致性项：γ·Charbonnier(f(n1), f(n2))
         rtv = self.w_rtv * self.rtv(f_n1)
         total = rec + cons + rtv
 
