@@ -2,8 +2,8 @@
 """Robust-N2N 一步法组合损失。
 
 L =  α·Charb(f(n1), n2) + β·Charb(f(n2), n1)      # 对称 N2N（Charbonnier 已并入，不再单列）
-   + γ·mean|f(n1) − f(n2)|                          # 一致性（DenoiseGAN self-constraint 第三项）
-   + λ·RTV(f(n1))                                    # 边缘/结构正则
+   + γ·Charb(f(n1), f(n2))                          # 一致性（DenoiseGAN self-constraint 第三项）
+   + λ·RTV(f(n1))                                    # 边缘/结构正则（λ=0 时跳过计算）
    + [训练过半后] w_white·( L_spatial(w) + β_freq·L_freq(w) ),  w = f(n1) − f(n2)   # 残差白度正则
 
 白度作用对象 w=f(n1)−f(n2)：干净信号 y 相消 → 信号无关、不误伤血管；其中残留的相关结构会被
@@ -53,7 +53,8 @@ class RobustN2NLoss(nn.Module):
             rec = self.alpha * self.charb(f_n1, n2) + self.beta * self.charb(f_n2, n1)
             cons = self.gamma * self.charb(f_n1, f_n2)  # 一致性项：γ·Charbonnier(f(n1), f(n2))
         diff = torch.mean(torch.abs(f_n1 - f_n2))   # 未加权 L1：仅作塌缩诊断量，diff→0 表示输出塌成常数
-        rtv = self.w_rtv * self.rtv(f_n1)
+        # w_rtv=0 时直接跳过（省掉一次 RTV 前向）
+        rtv = self.w_rtv * self.rtv(f_n1) if self.w_rtv > 0 else torch.zeros((), device=f_n1.device, dtype=f_n1.dtype)
         total = rec + cons + rtv
 
         white = torch.zeros((), device=f_n1.device, dtype=f_n1.dtype)
