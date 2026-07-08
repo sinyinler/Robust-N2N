@@ -36,7 +36,7 @@ class RobustN2NLoss(nn.Module):
         self_target: bool = False,
     ):
         super().__init__()
-        # self_target=True: 像素靶换成自重建 f(n1)->n1 / f(n2)->n2（恒等靶，并去掉一致性项），仅供对照实验
+        # self_target=True: 像素靶换成自重建 f(n1)->n1（仅此一项，恒等靶，去掉一致性项），仅供对照实验
         self.self_target = bool(self_target)
         self.alpha, self.beta, self.gamma = float(alpha), float(beta), float(gamma)
         self.w_white, self.w_rtv = float(w_white), float(w_rtv)
@@ -46,8 +46,8 @@ class RobustN2NLoss(nn.Module):
 
     def forward(self, f_n1, n1, f_n2, n2, use_whitening: bool = False):
         """n1/n2：同场景两帧噪声图；f_n1=f(n1), f_n2=f(n2)。use_whitening：是否已过半、开白度项。"""
-        if self.self_target:                        # 对照实验：自重建恒等靶，去掉一致性项
-            rec = self.alpha * self.charb(f_n1, n1) + self.beta * self.charb(f_n2, n2)
+        if self.self_target:                        # 对照实验：自重建恒等靶（仅 f(n1)->n1），去掉一致性项
+            rec = self.alpha * self.charb(f_n1, n1)  # 只留 f(n1)->n1，不加 f(n2)->n2
             cons = torch.zeros((), device=f_n1.device, dtype=f_n1.dtype)
         else:                                        # 默认：对称 N2N（拿兄弟帧当靶）
             rec = self.alpha * self.charb(f_n1, n2) + self.beta * self.charb(f_n2, n1)
