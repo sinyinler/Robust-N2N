@@ -48,7 +48,8 @@ class PredHead(nn.Module):
 
 
 class FeatureConsistencyLoss(nn.Module):
-    def __init__(self, channels, dim: int = 128, pred_hidden=None, weights=None, use_proj: bool = True):
+    def __init__(self, channels, dim: int = 128, pred_hidden=None, weights=None, use_proj: bool = True,
+                 normalize_weights: bool = False):
         super().__init__()
         self.use_proj = bool(use_proj)
         # dim<=0（或 None）: 每个尺度用原生通道 C（projector C→C→C）
@@ -64,6 +65,10 @@ class FeatureConsistencyLoss(nn.Module):
         self.pred_hiddens = [max(4, d // 4) if auto_h else int(pred_hidden) for d in self.proj_dims]
         self.preds = nn.ModuleList([PredHead(d, h) for d, h in zip(self.proj_dims, self.pred_hiddens)])
         self.weights = list(weights) if weights is not None else [1.0] * len(channels)
+        # normalize_weights: 尺度权重归一化为和=1（变成"分布"，w_feat 成为唯一的总强度旋钮）
+        if normalize_weights and sum(self.weights) > 0:
+            s = sum(self.weights)
+            self.weights = [w / s for w in self.weights]
 
     @staticmethod
     def _neg_cos(p, z):

@@ -114,6 +114,7 @@ def main():
     p.add_argument("--w_white", type=float, default=0.0)
     p.add_argument("--feat_use_proj", type=int, default=0)
     p.add_argument("--feat_dim", type=int, default=128, help="feat_use_proj=1 时生效；0=原生通道")
+    p.add_argument("--feat_normalize", type=int, default=0, help="1=尺度权重归一化为和=1")
     p.add_argument("--seed", type=int, default=42)
     # ---- 每条臂训完自动跑单图评测（infer_eval_robust.py）----
     p.add_argument("--eval", type=int, default=1, help="1=每条臂训完自动评测并收指标")
@@ -148,6 +149,7 @@ def main():
                "--w_white", str(args.w_white), "--seed", str(args.seed),
                "--w_feat", str(w_feat),
                "--feat_use_proj", str(args.feat_use_proj), "--feat_dim", str(args.feat_dim),
+               "--feat_normalize", str(args.feat_normalize),
                "--feat_scales", *[s for s, _ in sel],
                "--feat_weights", *[str(w) for _, w in sel],
                "--save_dir", save_dir, "--log_dir", os.path.join(args.root, "tb", name)]

@@ -91,6 +91,8 @@ def parse_args() -> argparse.Namespace:
                    help="在哪些深度加 projector 算一致性（浅→深）。out3=encoder3, bridge=bottleneck 为别名")
     p.add_argument("--feat_weights", type=float, nargs="*", default=None,
                    help="各尺度权重，长度须与 --feat_scales 一致；不给则用默认(enc1:0.1,enc2:0.2,enc3:0.5,bn:1.0)")
+    p.add_argument("--feat_normalize", type=int, default=0,
+                   help="1=尺度权重归一化为和=1（w_feat 成为唯一总强度旋钮，权重变成分布）")
     args = p.parse_args()
     if args.data_index_min < 0:
         args.data_index_min = None
@@ -138,7 +140,10 @@ def train(args) -> None:
     print(f"[INFO] feature consistency scales={args.feat_scales} (idx={feat_idx}, ch={feat_ch}, w={feat_w})")
     criterion_feat = FeatureConsistencyLoss(
         channels=feat_ch, dim=args.feat_dim, pred_hidden=args.feat_pred_hidden,
-        weights=feat_w, use_proj=bool(args.feat_use_proj)).to(device)
+        weights=feat_w, use_proj=bool(args.feat_use_proj),
+        normalize_weights=bool(args.feat_normalize)).to(device)
+    if args.feat_normalize:
+        print(f"[INFO] feat weights normalized to sum=1: {[round(w, 3) for w in criterion_feat.weights]}")
     print(f"[INFO] feat projection dims={criterion_feat.proj_dims} "
           f"(feat_dim={args.feat_dim}{' → 原生通道' if args.feat_dim <= 0 else ''}); "
           f"predictor hidden={criterion_feat.pred_hiddens}"
