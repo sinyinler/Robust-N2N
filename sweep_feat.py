@@ -27,24 +27,31 @@ CHANNELS = {"encoder1": 16, "encoder2": 32, "encoder3": 64, "bottleneck": 80}
 
 
 def parse_arm(spec: str):
-    """'0.05:0,0,0.9,1.0' -> (w_feat, [(scale, w), ...])，权重为 0 的尺度剔除。"""
+    """'[γ@]w_feat:w_enc1,w_enc2,w_enc3,w_bottleneck' -> (gamma|None, w_feat, [(scale,w),...])。
+    可选前缀 'γ@' 逐臂覆盖一致性项 γ·Charb(f(n1),f(n2)) 的权重；不写则用全局 --gamma。
+    尺度权重为 0 的尺度剔除。"""
+    gamma = None
+    if "@" in spec:
+        g, spec = spec.split("@", 1)
+        gamma = float(g)
     try:
         head, tail = spec.split(":")
         w_feat = float(head)
         ws = [float(x) for x in tail.split(",")]
     except ValueError:
-        raise ValueError(f"臂格式错误: {spec!r}，应为 'w_feat:w_enc1,w_enc2,w_enc3,w_bottleneck'")
+        raise ValueError(f"臂格式错误: {spec!r}，应为 '[γ@]w_feat:w_enc1,w_enc2,w_enc3,w_bottleneck'")
     if len(ws) != len(SCALES):
         raise ValueError(f"臂 {spec!r} 需要 {len(SCALES)} 个尺度权重（enc1,enc2,enc3,bottleneck）")
     sel = [(s, w) for s, w in zip(SCALES, ws) if w > 0]
     if not sel:
         raise ValueError(f"臂 {spec!r} 所有尺度权重都是 0，没有特征损失可算")
-    return w_feat, sel
+    return gamma, w_feat, sel
 
 
-def arm_name(w_feat, sel) -> str:
+def arm_name(gamma, w_feat, sel) -> str:
     parts = "_".join(f"{SHORT[s]}{w:g}" for s, w in sel)
-    return f"wf{w_feat:g}_{parts}"
+    g = f"g{gamma:g}_" if gamma is not None else ""
+    return f"{g}wf{w_feat:g}_{parts}"
 
 
 def std_target(scale: str, args) -> float:
@@ -125,8 +132,9 @@ def main():
     os.makedirs(log_root, exist_ok=True)
 
     results, n2n_base = [], None
-    for i, (w_feat, sel) in enumerate(arms, 1):
-        name = arm_name(w_feat, sel)
+    for i, (gamma, w_feat, sel) in enumerate(arms, 1):
+        g_val = args.gamma if gamma is None else gamma       # 逐臂 γ，未指定用全局
+        name = arm_name(gamma, w_feat, sel)
         save_dir = os.path.join(ck_root, name)
         log_path = os.path.join(log_root, f"{name}.log")
         ckpt = os.path.join(save_dir, f"model_epoch_{args.epochs}.pth")
@@ -136,7 +144,7 @@ def main():
                "--levels", *[str(x) for x in args.levels],
                "--epochs", str(args.epochs), "--crop_size", str(args.crop_size),
                "--batch_size", str(args.batch_size), "--lr", str(args.lr),
-               "--rtv_weight", str(args.rtv_weight), "--gamma", str(args.gamma),
+               "--rtv_weight", str(args.rtv_weight), "--gamma", str(g_val),
                "--w_white", str(args.w_white), "--seed", str(args.seed),
                "--w_feat", str(w_feat),
                "--feat_use_proj", str(args.feat_use_proj), "--feat_dim", str(args.feat_dim),
@@ -144,7 +152,7 @@ def main():
                "--feat_weights", *[str(w) for _, w in sel],
                "--save_dir", save_dir, "--log_dir", os.path.join(args.root, "tb", name)]
 
-        print(f"\n=== [{i}/{len(arms)}] {name} ===")
+        print(f"\n=== [{i}/{len(arms)}] {name}  (gamma={g_val:g}) ===")
         if args.dry_run:
             print(" ".join(cmd)); continue
         if os.path.exists(ckpt) and not args.force:
@@ -154,7 +162,7 @@ def main():
                 ret = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT)
             if ret.returncode != 0:
                 print(f"[FAIL] 退出码 {ret.returncode}，看 {log_path}")
-                results.append((name, w_feat, sel, None, None)); continue
+                results.append((name, g_val, w_feat, sel, None, None)); continue
 
         ev = None
         if args.eval and os.path.exists(ckpt):
@@ -163,7 +171,7 @@ def main():
                 n2n_base = base                          # N2N 基线各臂相同，记一次即可
             if ev:
                 print(f"  PSNR={ev['psnr']:.3f}  MSSIM={ev['mssim']:.4f}  r={ev['r']:.4f}")
-        results.append((name, w_feat, sel, parse_log(log_path), ev))
+        results.append((name, g_val, w_feat, sel, parse_log(log_path), ev))
 
     if args.dry_run:
         return
@@ -176,14 +184,15 @@ def main():
     if n2n_base:
         lines += [f"**N2N 基线**（{os.path.basename(args.n2n)}）: PSNR={n2n_base['psnr']:.3f}  "
                   f"MSSIM={n2n_base['mssim']:.4f}  r={n2n_base['r']:.4f} —— ΔPSNR>0 才算赢过 N2N。", ""]
-    lines += ["`std` 括号内为健康值 ≈1/√dim；往 0 掉 = 塌缩。`rec` 越低越好，`feat` 越负说明特征越对齐。", "",
-              "| 臂 | w_feat | 尺度(权重) | PSNR | ΔPSNR | MSSIM | r | rec | diff | feat | "
+    lines += ["`std` 括号内为健康值 ≈1/√dim；往 0 掉 = 塌缩。`rec` 越低越好，`feat` 越负说明特征越对齐。"
+              "`γ` = 一致性项 Charb(f(n1),f(n2)) 的权重。", "",
+              "| 臂 | γ | w_feat | 尺度(权重) | PSNR | ΔPSNR | MSSIM | r | rec | diff | feat | "
               + " | ".join(f"std[{SHORT[s]}]" for s in SCALES) + " |",
-              "|---|---|---|---|---|---|---|---|---|---|" + "---|" * len(SCALES)]
-    for name, w_feat, sel, m, ev in results:
+              "|---|---|---|---|---|---|---|---|---|---|---|" + "---|" * len(SCALES)]
+    for name, g_val, w_feat, sel, m, ev in results:
         scales_txt = ", ".join(f"{SHORT[s]}={w:g}" for s, w in sel)
         if m is None:
-            lines.append(f"| {name} | {w_feat:g} | {scales_txt} | 失败 |" + " - |" * (6 + len(SCALES))); continue
+            lines.append(f"| {name} | {g_val:g} | {w_feat:g} | {scales_txt} | 失败 |" + " - |" * (6 + len(SCALES))); continue
         if ev:
             d = f"{ev['psnr'] - base_psnr:+.3f}" if base_psnr else "-"
             ev_txt = f"{ev['psnr']:.3f} | {d} | {ev['mssim']:.4f} | {ev['r']:.4f}"
@@ -195,7 +204,7 @@ def main():
         for s in SCALES:
             v = std_by_scale.get(s)
             cells.append("-" if v is None else f"{v:.3f} ({std_target(s, args):.3f})")
-        lines.append(f"| {name} | {w_feat:g} | {scales_txt} | {ev_txt} | {m.get('rec', float('nan')):.5f} | "
+        lines.append(f"| {name} | {g_val:g} | {w_feat:g} | {scales_txt} | {ev_txt} | {m.get('rec', float('nan')):.5f} | "
                      f"{m.get('diff', float('nan')):.5f} | {m.get('feat', float('nan')):.4f} | " + " | ".join(cells) + " |")
 
     out = os.path.join(args.root, "summary.md")
