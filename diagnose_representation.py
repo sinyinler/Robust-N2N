@@ -25,8 +25,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from diag_common import collect_frames
-from infer_eval_robust import load2d
+from diag_common import collect_frames, load_batch
 from models.denoiser_feats import DenoiserWithFeats
 from utils.checkpoint import load_weights_flexible
 
@@ -85,12 +84,8 @@ def main(args):
         print("[WARN] 同场景 batch：「跨样本 std」不可解读（同场景不同帧的深层特征本就该相似）。"
               "\n       effective rank / 协方差谱不受影响，仍然有效。")
 
-    batch = torch.stack([torch.from_numpy(np.log1p(np.clip(load2d(f), 0, None)).astype(np.float32))
-                         for f in frames])[:, None].to(device)
-    h, w = batch.shape[-2:]
-    ph, pw = (32 - h % 32) % 32, (32 - w % 32) % 32
-    if ph or pw:
-        batch = F.pad(batch, (0, pw, 0, ph), mode="reflect")
+    batch = load_batch(frames, args.crop, device)    # 中心裁剪到统一尺寸（不同场景尺寸不同）
+    print(f"[INFO] batch shape = {tuple(batch.shape)}")
 
     for tag, ckpt in [("N2N", args.n2n_checkpoint), ("+feature", args.feat_checkpoint)]:
         if not ckpt:
@@ -118,6 +113,7 @@ def parse_args():
     p.add_argument("--frame_idx", type=int, default=0)
     p.add_argument("--scene_dir", default="", help="退回同场景模式（跨样本 std 不可解读）")
     p.add_argument("--batch", type=int, default=8)
+    p.add_argument("--crop", type=int, default=512, help="中心裁剪到该尺寸")
     p.add_argument("--all_scales", type=int, default=0, help="1=连 encoder1/2 一起报")
     p.add_argument("--device", default="")
     a = p.parse_args()

@@ -11,6 +11,9 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import numpy as np
+import torch
+
 
 def natural_key(p: Path):
     m = re.findall(r"\d+", p.stem)
@@ -44,3 +47,19 @@ def collect_frames(scene_root: str | None, n_scenes: int, frame_idx: int,
     print(f"[WARN] 使用**同一场景**的 {len(frames)} 帧："
           f"batch_shuffle 与「跨样本 std」在此设置下不可解读（同场景不同帧本就相似）。")
     return frames, False
+
+
+def center_crop(a: np.ndarray, size: int) -> np.ndarray:
+    """中心裁剪到 size×size。不同场景图像尺寸不同，必须裁到统一大小才能 stack。"""
+    h, w = a.shape
+    if h < size or w < size:
+        raise ValueError(f"图像 {h}×{w} 小于裁剪尺寸 {size}，请调小 --crop")
+    t, l = (h - size) // 2, (w - size) // 2
+    return a[t:t + size, l:l + size]
+
+
+def load_batch(frames, crop: int, device) -> torch.Tensor:
+    """帧 → 中心裁剪 → log1p → (N,1,crop,crop) 张量。crop 取 32 的倍数即无需再 pad。"""
+    from infer_eval_robust import load2d
+    arrs = [np.log1p(np.clip(center_crop(load2d(f), crop), 0, None)).astype(np.float32) for f in frames]
+    return torch.stack([torch.from_numpy(a) for a in arrs])[:, None].to(device)

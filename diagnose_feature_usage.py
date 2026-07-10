@@ -32,8 +32,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from diag_common import collect_frames
-from infer_eval_robust import load2d
+from diag_common import collect_frames, load_batch
 from models.denoiser_feats import DenoiserWithFeats
 from utils.checkpoint import load_weights_flexible
 
@@ -75,12 +74,8 @@ def main(args):
     if not multi_scene:
         print("[WARN] 同场景 batch：batch_shuffle 一列不可解读，请改用 --scene_root。")
 
-    x = torch.stack([torch.from_numpy(np.log1p(np.clip(load2d(f), 0, None)).astype(np.float32))
-                     for f in frames])[:, None].to(device)
-    h, w = x.shape[-2:]
-    ph, pw = (32 - h % 32) % 32, (32 - w % 32) % 32
-    if ph or pw:
-        x = F.pad(x, (0, pw, 0, ph), mode="reflect")
+    x = load_batch(frames, args.crop, device)      # 中心裁剪到统一尺寸（不同场景尺寸不同）
+    print(f"[INFO] batch shape = {tuple(x.shape)}")
 
     for tag, ckpt in [("N2N", args.n2n_checkpoint), ("+feature", args.feat_checkpoint)]:
         if not ckpt:
@@ -120,6 +115,7 @@ def parse_args():
     # 退回：同场景（仅对照）
     p.add_argument("--scene_dir", default="")
     p.add_argument("--n_frames", type=int, default=8)
+    p.add_argument("--crop", type=int, default=512, help="中心裁剪到该尺寸（32 的倍数）")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="")
     a = p.parse_args()
