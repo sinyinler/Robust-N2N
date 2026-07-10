@@ -11,6 +11,7 @@
     PSNR(y_p ‖ y_0)                        （以未扰动输出为参考，越高 = 越不依赖）
 不需要任何 reference，也不受过平滑影响。
 
+decoder 有四个输入（bridge, out1, out2, out3），全部单独测一遍，画出信息流地图。
 out3 同时 (a) 作为 Bridge 输入、(b) 直接进 decoder 的 cat1 skip，故必须分支隔离：
   bridge-only    : 用原始 out3 正常算 bridge，只替换送进 decoder 的 bridge
   out3-skip-only : 用原始 out3 算 bridge，只替换 decoder 拼接处的 out3
@@ -36,7 +37,8 @@ from diag_common import collect_frames, load_batch
 from models.denoiser_feats import DenoiserWithFeats
 from utils.checkpoint import load_weights_flexible
 
-MODES = ["bridge", "out3skip", "joint"]
+# 把 decoder 的四个输入全部测一遍，画出「信息实际走哪条线」的完整地图
+MODES = ["bridge", "out3skip", "out2skip", "out1skip", "deep(bridge+out3)", "shallow(out1+out2)"]
 KINDS = ["zero", "batch_shuffle", "spatial_shuffle"]
 
 
@@ -58,12 +60,23 @@ def perturb(t: torch.Tensor, kind: str, gen: torch.Generator) -> torch.Tensor:
 def forward_intervened(model, x, mode=None, kind="zero", gen=None):
     out1, out2, out3 = model.encoder(x)
     bridge = model.bridge(out3)                     # 始终用**原始** out3 计算 bridge
-    b_in, o3_in = bridge, out3
-    if mode in ("bridge", "joint"):
+    b_in, o3_in, o2_in, o1_in = bridge, out3, out2, out1
+
+    hit_bridge = mode in ("bridge", "deep(bridge+out3)")
+    hit_out3 = mode in ("out3skip", "deep(bridge+out3)")
+    hit_out2 = mode in ("out2skip", "shallow(out1+out2)")
+    hit_out1 = mode in ("out1skip", "shallow(out1+out2)")
+
+    if hit_bridge:
         b_in = perturb(bridge, kind, gen)
-    if mode in ("out3skip", "joint"):
-        o3_in = perturb(out3, kind, gen)
-    return model.transformer_unit(model.decoder(b_in, out1, out2, o3_in))
+    if hit_out3:
+        o3_in = perturb(out3, kind, gen)            # 只替换 decoder 拼接处，bridge 仍由原始 out3 算
+    if hit_out2:
+        o2_in = perturb(out2, kind, gen)
+    if hit_out1:
+        o1_in = perturb(out1, kind, gen)
+
+    return model.transformer_unit(model.decoder(b_in, o1_in, o2_in, o3_in))
 
 
 @torch.no_grad()
@@ -86,8 +99,8 @@ def main(args):
         n0 = y0.flatten(1).norm(dim=1)
 
         print(f"  输出敏感性：rel_Δ = ‖y_p − y_0‖/‖y_0‖   |   PSNR(y_p‖y_0)（以未扰动输出为参考）")
-        print(f"  {'干预分支':<12} | " + " | ".join(f"{k:^26}" for k in KINDS))
-        print("  " + "-" * 96)
+        print(f"  {'干预分支':<20} | " + " | ".join(f"{k:^26}" for k in KINDS))
+        print("  " + "-" * 104)
         for mode in MODES:
             cells = []
             for kind in KINDS:
@@ -98,7 +111,7 @@ def main(args):
                 rng = (y0.flatten(1).amax(dim=1) - y0.flatten(1).amin(dim=1)).clamp_min(1e-8)
                 psnr = (10 * torch.log10(rng ** 2 / mse.clamp_min(1e-12))).mean().item()
                 cells.append(f"rel_Δ={rel * 100:6.2f}%  PSNR={psnr:6.2f}")
-            print(f"  {mode:<12} | " + " | ".join(f"{c:^26}" for c in cells))
+            print(f"  {mode:<20} | " + " | ".join(f"{c:^26}" for c in cells))
 
     print("\n判读：rel_Δ ≈ 0（且 PSNR(y_p‖y_0) 很高）→ 解码器几乎不依赖该分支。"
           "\n      别用「对 reference 的 PSNR」判断依赖性：破坏特征会过平滑，反而抬高 PSNR。")
