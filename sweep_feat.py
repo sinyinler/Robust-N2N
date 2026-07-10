@@ -119,6 +119,8 @@ def main():
     p.add_argument("--batch_size", type=int, default=24)
     p.add_argument("--lr", type=float, default=0.01)
     p.add_argument("--rtv_weight", type=float, default=0.0)
+    p.add_argument("--alpha", type=float, default=1.0, help="N2N 正向权重")
+    p.add_argument("--beta", type=float, default=1.0, help="N2N 反向权重；0=单向（干净 base，等价原始 N2N）")
     p.add_argument("--gamma", type=float, default=0.1)
     p.add_argument("--w_white", type=float, default=0.0)
     p.add_argument("--feat_use_proj", type=int, default=0)
@@ -130,7 +132,10 @@ def main():
     p.add_argument("--reference", type=str, default="/home/songyd/Projects/Robust-N2N/reference.npy")
     p.add_argument("--scene_dir", type=str, default="/mnt2/songyd/5x5/5x5x4/0/npy", help="评测帧目录（内含 .npy）")
     p.add_argument("--n_frames", type=int, default=50)
-    p.add_argument("--baseline_checkpoint", type=str, default="", help="N2N 基线 checkpoint；给了则同帧配对对比")
+    p.add_argument("--baseline_checkpoint", type=str, default="", help="外部基线 checkpoint；给了则同帧配对对比")
+    p.add_argument("--baseline_arm", type=str, default="",
+                   help="用**本 sweep 内同 seed 的某条臂**当配对基线（如 '0:0,0,1,1' 即 w_feat=0）。"
+                        "代码路径完全一致，消除 train_n2n/train_robust 的脚本差异。优先级高于 --baseline_checkpoint。")
     p.add_argument("--max", type=float, default=255.0, help="PSNR/MSSIM 的 data_range")
     p.add_argument("--device", type=str, default="")
     # ---- sweep 本身 ----
@@ -145,23 +150,8 @@ def main():
     os.makedirs(log_root, exist_ok=True)
     os.makedirs(os.path.join(args.root, "eval"), exist_ok=True)
 
-    # ---- 评测准备：加载 reference / 帧 / 基线曲线（一次）----
-    frames = ref = device = dr = base_curve = None
-    if args.eval and not args.dry_run:
-        import numpy as np
-        import torch
-        from infer_eval_robust import load2d
-        device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
-        dr = float(args.max)
-        ref = load2d(args.reference)
-        frames = load_frames(args.scene_dir, args.n_frames)
-        print(f"[INFO] eval: 场景={args.scene_dir} 前 {len(frames)} 帧; ref={args.reference} shape={ref.shape}; dr={dr:g}")
-        if args.baseline_checkpoint:
-            bp, bs, br = multiframe_eval(args.baseline_checkpoint, frames, ref, dr, device)
-            base_curve = (bp, bs, br)
-            print(f"[INFO] baseline N2N（{len(frames)}帧）: PSNR {np.mean(bp):.3f}±{np.std(bp, ddof=1):.3f}  "
-                  f"MSSIM {np.mean(bs):.4f}  r {np.mean(br):.4f}")
-
+    # ---- 第一遍：只训练。基线臂也在其中，训完才能拿来配对 ----
+    ckpt_of = {}                                            # arm name -> checkpoint 路径
     results = []
     for i, (gamma, w_feat, sel) in enumerate(arms, 1):
         g_val = args.gamma if gamma is None else gamma       # 逐臂 γ，未指定用全局
@@ -175,7 +165,8 @@ def main():
                "--levels", *[str(x) for x in args.levels],
                "--epochs", str(args.epochs), "--crop_size", str(args.crop_size),
                "--batch_size", str(args.batch_size), "--lr", str(args.lr),
-               "--rtv_weight", str(args.rtv_weight), "--gamma", str(g_val),
+               "--rtv_weight", str(args.rtv_weight),
+               "--alpha", str(args.alpha), "--beta", str(args.beta), "--gamma", str(g_val),
                "--w_white", str(args.w_white), "--seed", str(args.seed),
                "--w_feat", str(w_feat),
                "--feat_use_proj", str(args.feat_use_proj), "--feat_dim", str(args.feat_dim),
@@ -196,31 +187,60 @@ def main():
                 print(f"[FAIL] 退出码 {ret.returncode}，看 {log_path}")
                 results.append((name, g_val, w_feat, sel, None, None)); continue
 
-        ev = None
-        if args.eval and os.path.exists(ckpt):
-            import numpy as np
+        ckpt_of[name] = ckpt
+        results.append((name, g_val, w_feat, sel, parse_log(log_path), None))
+
+    if args.dry_run:
+        return
+
+    # ---- 第二遍：评测。基线可以是本 sweep 内同 seed 的某条臂（代码路径完全一致）----
+    base_curve = frames = ref = device = dr = None
+    if args.eval:
+        import numpy as np
+        import torch
+        from infer_eval_robust import load2d
+        device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
+        dr = float(args.max)
+        ref = load2d(args.reference)
+        frames = load_frames(args.scene_dir, args.n_frames)
+        print(f"\n[INFO] eval: 场景={args.scene_dir} 前 {len(frames)} 帧; ref={args.reference} shape={ref.shape}; dr={dr:g}")
+
+        base_ckpt, base_tag = "", ""
+        if args.baseline_arm:                                # 优先：本 sweep 内的臂（同 seed、同代码路径）
+            bg, bwf, bsel = parse_arm(args.baseline_arm)
+            bname = arm_name(bg, bwf, bsel)
+            if bname not in ckpt_of or not os.path.exists(ckpt_of[bname]):
+                raise RuntimeError(f"--baseline_arm 指定的臂 {bname} 不在本 sweep 里或未训练成功")
+            base_ckpt, base_tag = ckpt_of[bname], f"同 seed 臂 {bname}"
+        elif args.baseline_checkpoint:
+            base_ckpt, base_tag = args.baseline_checkpoint, os.path.basename(args.baseline_checkpoint)
+        if base_ckpt:
+            bp, bs, br = multiframe_eval(base_ckpt, frames, ref, dr, device)
+            base_curve = (bp, bs, br)
+            print(f"[INFO] 基线（{base_tag}）: PSNR {np.mean(bp):.3f}±{np.std(bp, ddof=1):.3f}  "
+                  f"MSSIM {np.mean(bs):.4f}  r {np.mean(br):.4f}")
+
+        for k, (name, g_val, w_feat, sel, m, _) in enumerate(results):
+            ckpt = ckpt_of.get(name, "")
+            if m is None or not ckpt or not os.path.exists(ckpt):
+                continue
             p_arr, s_arr, r_arr = multiframe_eval(ckpt, frames, ref, dr, device)
-            ev = {"p": p_arr, "s": s_arr, "r": r_arr}
+            results[k] = (name, g_val, w_feat, sel, m, {"p": p_arr, "s": s_arr, "r": r_arr})
             pm, ps = mstd(p_arr)
-            msg = f"  PSNR {pm:.3f}±{ps:.3f}  MSSIM {np.mean(s_arr):.4f}  r {np.mean(r_arr):.4f}"
+            msg = f"  {name:<26} PSNR {pm:.3f}±{ps:.3f}  MSSIM {np.mean(s_arr):.4f}  r {np.mean(r_arr):.4f}"
             if base_curve is not None:
                 d = p_arr - base_curve[0]
                 dm, ds = mstd(d)
                 msg += f"  | ΔPSNR {dm:+.3f}±{ds:.3f}  赢 {int((d > 0).sum())}/{len(d)}"
             print(msg)
-            # 逐帧 CSV
             with open(os.path.join(args.root, "eval", f"{name}.csv"), "w") as f:
                 base_p = base_curve[0] if base_curve is not None else [None] * len(frames)
                 f.write("frame,psnr,mssim,r" + (",base_psnr,dPSNR\n" if base_curve is not None else "\n"))
-                for k, fp in enumerate(frames):
-                    row = f"{fp.stem},{p_arr[k]:.4f},{s_arr[k]:.4f},{r_arr[k]:.4f}"
+                for j, fp in enumerate(frames):
+                    row = f"{fp.stem},{p_arr[j]:.4f},{s_arr[j]:.4f},{r_arr[j]:.4f}"
                     if base_curve is not None:
-                        row += f",{base_p[k]:.4f},{p_arr[k] - base_p[k]:.4f}"
+                        row += f",{base_p[j]:.4f},{p_arr[j] - base_p[j]:.4f}"
                     f.write(row + "\n")
-        results.append((name, g_val, w_feat, sel, parse_log(log_path), ev))
-
-    if args.dry_run:
-        return
 
     build_report(results, base_curve, frames, args)
 
@@ -233,12 +253,12 @@ def build_report(results, base_curve, frames, args):
 
     lines = ["# 特征一致性权重 sweep 汇总（多帧平均，降方差）", "",
              f"共用配置: levels={args.levels} epochs={args.epochs} batch={args.batch_size} lr={args.lr} "
-             f"rtv={args.rtv_weight} gamma={args.gamma} feat_use_proj={args.feat_use_proj} "
+             f"rtv={args.rtv_weight} alpha={args.alpha} beta={args.beta} gamma={args.gamma} feat_use_proj={args.feat_use_proj} "
              f"feat_normalize={args.feat_normalize} seed={args.seed}",
              f"评测: {args.scene_dir} 前 {len(frames) if frames else 0} 帧 vs {os.path.basename(args.reference)} "
              f"(data_range={args.max:g})", ""]
     if base_p is not None:
-        lines += [f"**N2N 基线**（{os.path.basename(args.baseline_checkpoint)}）: "
+        lines += [f"**基线**（{args.baseline_arm or os.path.basename(args.baseline_checkpoint)}）: "
                   f"PSNR {base_pm:.3f}±{base_ps:.3f}  MSSIM {np.mean(base_curve[1]):.4f}  r {np.mean(base_curve[2]):.4f}", ""]
     lines += ["判据：**ΔPSNR 的 mean 要大于 std 才算稳定赢过 N2N**（否则差异在噪声内）。"
               "`std[·]` 括号内为塌缩健康值≈1/√dim。", "",
