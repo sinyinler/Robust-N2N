@@ -93,6 +93,11 @@ def parse_args() -> argparse.Namespace:
                    help="各尺度权重，长度须与 --feat_scales 一致；不给则用默认(enc1:0.1,enc2:0.2,enc3:0.5,bn:1.0)")
     p.add_argument("--feat_normalize", type=int, default=0,
                    help="1=尺度权重归一化为和=1（w_feat 成为唯一总强度旋钮，权重变成分布）")
+    p.add_argument("--feat_pred_constant_lr", type=float, default=0.0,
+                   help=">0 时 predictor 用独立优化器、恒定 lr（不参与 OneCycle 衰减）。"
+                        "SimSiam §4.2 Table 1c：predictor 不衰减 lr 结果更好，论文正文即采用此设置。")
+    p.add_argument("--save_feat_head", type=int, default=0,
+                   help="1=同时保存 projector/predictor 权重（criterion_feat），供事后分析 z")
     args = p.parse_args()
     if args.data_index_min < 0:
         args.data_index_min = None
@@ -150,8 +155,18 @@ def train(args) -> None:
           f"{' (自动 dim//4)' if args.feat_pred_hidden is None else ' (手动指定)'}; "
           f"std 健康值≈1/√dim={[round(d**-0.5, 3) for d in criterion_feat.proj_dims]}")
 
-    optimizer = optim.AdamW(list(model.parameters()) + list(criterion_feat.parameters()),
-                            lr=args.lr_max, weight_decay=1e-4)
+    # predictor 是否独立、恒定 lr（SimSiam §4.2：h 应持续跟上最新表征，不应被强制收敛）
+    pred_params = list(criterion_feat.preds.parameters())
+    pred_ids = {id(p) for p in pred_params}
+    if args.feat_pred_constant_lr > 0:
+        main_params = [p for p in list(model.parameters()) + list(criterion_feat.parameters())
+                       if id(p) not in pred_ids]
+        opt_pred = optim.AdamW(pred_params, lr=args.feat_pred_constant_lr, weight_decay=1e-4)
+        print(f"[INFO] predictor 使用独立优化器，恒定 lr={args.feat_pred_constant_lr}（不参与 OneCycle）")
+    else:
+        main_params = list(model.parameters()) + list(criterion_feat.parameters())
+        opt_pred = None
+    optimizer = optim.AdamW(main_params, lr=args.lr_max, weight_decay=1e-4)
     scheduler = build_onecycle(optimizer, len(train_loader), args)
 
     total_steps = args.epochs * len(train_loader)
@@ -180,11 +195,15 @@ def train(args) -> None:
                 logs[f"std{si}"] = s
 
             optimizer.zero_grad(set_to_none=True)
+            if opt_pred is not None:
+                opt_pred.zero_grad(set_to_none=True)
             loss.backward()
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(
                     list(model.parameters()) + list(criterion_feat.parameters()), args.grad_clip)
             optimizer.step()
+            if opt_pred is not None:
+                opt_pred.step()      # 恒定 lr，不走 scheduler
             scheduler.step()
             global_step += 1
 
@@ -199,6 +218,9 @@ def train(args) -> None:
         save_path = os.path.join(args.save_dir, f"model_epoch_{epoch}.pth")
         state = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
         torch.save(state, save_path)
+        if args.save_feat_head:      # projector/predictor 不属于去噪模型，单独存，供事后分析 z
+            torch.save(criterion_feat.state_dict(),
+                       os.path.join(args.save_dir, f"feat_head_epoch_{epoch}.pth"))
         print(f"[EPOCH {epoch}] " + " ".join(f"{k}={avg[k]:.5f}" for k in
               ("total", "rec", "diff", "rtv", "feat", "std0", "std1", "std2", "std3", "white") if k in avg)
               + f"  saved={save_path}")
