@@ -94,6 +94,10 @@ def parse_args() -> argparse.Namespace:
                    help="各尺度权重，长度须与 --feat_scales 一致；不给则用默认(enc1:0.1,enc2:0.2,enc3:0.5,bn:1.0)")
     p.add_argument("--feat_normalize", type=int, default=0,
                    help="1=尺度权重归一化为和=1（w_feat 成为唯一总强度旋钮，权重变成分布）")
+    p.add_argument("--feat_pool", type=int, default=0,
+                   help="投影前把特征自适应平均池化到 G×G（0=不池化，逐像素余弦）。"
+                        "G=64 可拉平各尺度显存（否则 e1 的 128 维 projector 约 38GB），"
+                        "并把一致性从像素级变为区域级，不再强制高频不变。")
     p.add_argument("--feat_pred_constant_lr", type=float, default=0.0,
                    help=">0 时 predictor 用独立优化器、恒定 lr（不参与 OneCycle 衰减）。"
                         "SimSiam §4.2 Table 1c：predictor 不衰减 lr 结果更好，论文正文即采用此设置。")
@@ -152,7 +156,9 @@ def train(args) -> None:
     criterion_feat = FeatureConsistencyLoss(
         channels=feat_ch, dim=args.feat_dim, pred_hidden=args.feat_pred_hidden,
         weights=feat_w, use_proj=bool(args.feat_use_proj),
-        normalize_weights=bool(args.feat_normalize)).to(device)
+        normalize_weights=bool(args.feat_normalize), pool=args.feat_pool).to(device)
+    if args.feat_pool > 0:
+        print(f"[INFO] 特征投影前池化到 {args.feat_pool}×{args.feat_pool}（区域级一致性，不约束高频）")
     if args.feat_normalize:
         print(f"[INFO] feat weights normalized to sum=1: {[round(w, 3) for w in criterion_feat.weights]}")
     print(f"[INFO] feat projection dims={criterion_feat.proj_dims} "

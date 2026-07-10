@@ -49,8 +49,15 @@ class PredHead(nn.Module):
 
 class FeatureConsistencyLoss(nn.Module):
     def __init__(self, channels, dim: int = 128, pred_hidden=None, weights=None, use_proj: bool = True,
-                 normalize_weights: bool = False):
+                 normalize_weights: bool = False, pool: int = 0):
         super().__init__()
+        # pool>0：投影前先自适应平均池化到 pool×pool。三个作用：
+        #   (1) 拉平各尺度成本——否则 e1(128×512×512) 的 projector 激活约 38GB，单卡放不下
+        #       （DataParallel 只包 model，feats 会汇聚到 GPU0，特征损失不分片）；
+        #   (2) 更接近原始 SimSiam（一图一向量），而非逐像素余弦；
+        #   (3) 一致性变成区域级，不再强制像素级不变性 → 不威胁细血管高频。
+        # 代价：不再约束高频。这是有意的取舍。
+        self.pool = int(pool)
         self.use_proj = bool(use_proj)
         # dim<=0（或 None）: 每个尺度用原生通道 C（projector C→C→C）
         native = self.use_proj and ((dim is None) or (int(dim) <= 0))
@@ -76,10 +83,17 @@ class FeatureConsistencyLoss(nn.Module):
         z = F.normalize(z, dim=1)
         return -(p * z).sum(dim=1).mean()
 
+    def _maybe_pool(self, f):
+        """池化到 pool×pool；已不大于目标网格则原样返回（避免把 bn 上采样）。"""
+        if self.pool > 0 and min(f.shape[-2:]) > self.pool:
+            return F.adaptive_avg_pool2d(f, (self.pool, self.pool))
+        return f
+
     def forward(self, feats1, feats2):
         total = feats1[0].new_zeros(())
         stds = []
         for i, (f1, f2, pred, w) in enumerate(zip(feats1, feats2, self.preds, self.weights)):
+            f1, f2 = self._maybe_pool(f1), self._maybe_pool(f2)   # 先池化，再投影
             z1 = self.projs[i](f1) if self.use_proj else f1     # 带/不带 projector
             z2 = self.projs[i](f2) if self.use_proj else f2
             p1, p2 = pred(z1), pred(z2)
