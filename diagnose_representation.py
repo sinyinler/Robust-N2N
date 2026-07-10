@@ -25,6 +25,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from diag_common import collect_frames
 from infer_eval_robust import load2d
 from models.denoiser_feats import DenoiserWithFeats
 from utils.checkpoint import load_weights_flexible
@@ -78,10 +79,11 @@ def report(name: str, feat: torch.Tensor, max_pix: int = 20000):
 @torch.no_grad()
 def main(args):
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
-    from eval_curve import natural_key
-    frames = sorted(Path(args.scene_dir).glob("*.npy"), key=natural_key)[:args.batch]
-    if len(frames) < 2:
-        raise RuntimeError("至少需要 2 帧才能算跨样本 std")
+    frames, multi_scene = collect_frames(args.scene_root, args.n_scenes, args.frame_idx,
+                                         args.scene_dir, args.batch)
+    if not multi_scene:
+        print("[WARN] 同场景 batch：「跨样本 std」不可解读（同场景不同帧的深层特征本就该相似）。"
+              "\n       effective rank / 协方差谱不受影响，仍然有效。")
 
     batch = torch.stack([torch.from_numpy(np.log1p(np.clip(load2d(f), 0, None)).astype(np.float32))
                          for f in frames])[:, None].to(device)
@@ -111,11 +113,17 @@ def parse_args():
     p = argparse.ArgumentParser(description="native 编码器特征的表征健康度诊断（跨样本 std + 有效秩 + 协方差谱）")
     p.add_argument("--n2n_checkpoint", default="")
     p.add_argument("--feat_checkpoint", default="")
-    p.add_argument("--scene_dir", default="/mnt2/songyd/5x5/5x5x4/0/npy")
+    p.add_argument("--scene_root", default="/mnt2/songyd/5x5/5x5x4", help="其下每个子目录是一个场景（推荐）")
+    p.add_argument("--n_scenes", type=int, default=8)
+    p.add_argument("--frame_idx", type=int, default=0)
+    p.add_argument("--scene_dir", default="", help="退回同场景模式（跨样本 std 不可解读）")
     p.add_argument("--batch", type=int, default=8)
     p.add_argument("--all_scales", type=int, default=0, help="1=连 encoder1/2 一起报")
     p.add_argument("--device", default="")
-    return p.parse_args()
+    a = p.parse_args()
+    if a.scene_dir:
+        a.scene_root = ""
+    return a
 
 
 if __name__ == "__main__":
