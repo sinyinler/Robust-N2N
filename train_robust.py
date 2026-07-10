@@ -21,6 +21,7 @@ from tqdm import tqdm
 # 复用 N2N 的数据加载 / 调度 / 随机种子（数据与配对口径完全一致）
 from train_n2n import build_loaders, set_seed, build_onecycle
 from models.denoiser_feats import DenoiserWithFeats, FEAT_CHANNELS
+from models.aux_decoder import AuxDecoder
 from losses.robust_n2n_loss import RobustN2NLoss
 from losses.feature_consistency import FeatureConsistencyLoss
 
@@ -97,7 +98,12 @@ def parse_args() -> argparse.Namespace:
                    help=">0 时 predictor 用独立优化器、恒定 lr（不参与 OneCycle 衰减）。"
                         "SimSiam §4.2 Table 1c：predictor 不衰减 lr 结果更好，论文正文即采用此设置。")
     p.add_argument("--save_feat_head", type=int, default=0,
-                   help="1=同时保存 projector/predictor 权重（criterion_feat），供事后分析 z")
+                   help="1=同时保存 projector/predictor（及 aux 解码器）权重，供事后分析")
+    # ---- 瓶颈辅助重建：给 bridge 一个「必须携带信息」的理由（训练专用，不进 checkpoint）----
+    p.add_argument("--w_aux", type=float, default=0.0,
+                   help=">0 时启用无 skip 辅助解码器：w_aux·Charb(AuxDec(bridge(n1)), n2)。"
+                        "诊断显示 bridge 只承载约 10% 的场景身份信息，纯不变性目标可靠丢信息满足；"
+                        "该项强制 bridge 携带可重建整幅图的结构。")
     args = p.parse_args()
     if args.data_index_min < 0:
         args.data_index_min = None
@@ -155,16 +161,23 @@ def train(args) -> None:
           f"{' (自动 dim//4)' if args.feat_pred_hidden is None else ' (手动指定)'}; "
           f"std 健康值≈1/√dim={[round(d**-0.5, 3) for d in criterion_feat.proj_dims]}")
 
+    # 瓶颈辅助重建头（无 skip）。训练专用，参数与主网络一同优化，但不写进 model checkpoint。
+    aux_dec = AuxDecoder(in_channels=FEAT_CHANNELS[3]).to(device) if args.w_aux > 0 else None
+    if aux_dec is not None:
+        print(f"[INFO] 启用瓶颈辅助重建 w_aux={args.w_aux}："
+              f"L_aux = Charb(AuxDec(bridge(n1)), n2)，AuxDec 无 skip、推理时丢弃")
+
+    aux_params = list(aux_dec.parameters()) if aux_dec is not None else []
     # predictor 是否独立、恒定 lr（SimSiam §4.2：h 应持续跟上最新表征，不应被强制收敛）
     pred_params = list(criterion_feat.preds.parameters())
     pred_ids = {id(p) for p in pred_params}
     if args.feat_pred_constant_lr > 0:
-        main_params = [p for p in list(model.parameters()) + list(criterion_feat.parameters())
+        main_params = [p for p in list(model.parameters()) + list(criterion_feat.parameters()) + aux_params
                        if id(p) not in pred_ids]
         opt_pred = optim.AdamW(pred_params, lr=args.feat_pred_constant_lr, weight_decay=1e-4)
         print(f"[INFO] predictor 使用独立优化器，恒定 lr={args.feat_pred_constant_lr}（不参与 OneCycle）")
     else:
-        main_params = list(model.parameters()) + list(criterion_feat.parameters())
+        main_params = list(model.parameters()) + list(criterion_feat.parameters()) + aux_params
         opt_pred = None
     optimizer = optim.AdamW(main_params, lr=args.lr_max, weight_decay=1e-4)
     scheduler = build_onecycle(optimizer, len(train_loader), args)
@@ -191,6 +204,12 @@ def train(args) -> None:
             feat_loss, feat_stds = criterion_feat(feats1_sel, feats2_sel)   # 跨视图特征一致性
             loss = loss + args.w_feat * feat_loss
             logs["feat"] = float(feat_loss.detach())
+
+            if aux_dec is not None:                                # bridge 恒为 feats[3]，与 --feat_scales 无关
+                aux_out = aux_dec(feats1[3], n1.shape[-2:])        # 只从瓶颈重建，无任何 skip
+                aux_loss = criterion.charb(aux_out, n2)            # N2N 式靶子：独立噪声的兄弟帧
+                loss = loss + args.w_aux * aux_loss
+                logs["aux"] = float(aux_loss.detach())
             for si, s in enumerate(feat_stds):
                 logs[f"std{si}"] = s
 
@@ -200,7 +219,7 @@ def train(args) -> None:
             loss.backward()
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(
-                    list(model.parameters()) + list(criterion_feat.parameters()), args.grad_clip)
+                    list(model.parameters()) + list(criterion_feat.parameters()) + aux_params, args.grad_clip)
             optimizer.step()
             if opt_pred is not None:
                 opt_pred.step()      # 恒定 lr，不走 scheduler
@@ -218,11 +237,13 @@ def train(args) -> None:
         save_path = os.path.join(args.save_dir, f"model_epoch_{epoch}.pth")
         state = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
         torch.save(state, save_path)
-        if args.save_feat_head:      # projector/predictor 不属于去噪模型，单独存，供事后分析 z
+        if args.save_feat_head:      # projector/predictor/aux 都不属于去噪模型，单独存
             torch.save(criterion_feat.state_dict(),
                        os.path.join(args.save_dir, f"feat_head_epoch_{epoch}.pth"))
+            if aux_dec is not None:
+                torch.save(aux_dec.state_dict(), os.path.join(args.save_dir, f"aux_dec_epoch_{epoch}.pth"))
         print(f"[EPOCH {epoch}] " + " ".join(f"{k}={avg[k]:.5f}" for k in
-              ("total", "rec", "diff", "rtv", "feat", "std0", "std1", "std2", "std3", "white") if k in avg)
+              ("total", "rec", "diff", "rtv", "feat", "aux", "std0", "std1", "std2", "std3", "white") if k in avg)
               + f"  saved={save_path}")
 
 
