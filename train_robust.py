@@ -133,6 +133,7 @@ def train(args) -> None:
     if args.bias_free:
         from models.bias_free import make_bias_free, count_additive_constants
         make_bias_free(model)
+        model = model.to(device)     # 新建的 BFBatchNorm2d 默认在 CPU，须再搬回 device
         print(f"[INFO] Bias-Free 改造完成，残留加性成分={count_additive_constants(model)}（应全 0）")
     if args.data_parallel and torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)

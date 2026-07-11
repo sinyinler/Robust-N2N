@@ -36,6 +36,7 @@ def load_model(ckpt, device, bias_free=False):
     if bias_free:                                              # bias-free checkpoint 架构不同，须先改造再加载
         from models.bias_free import make_bias_free
         make_bias_free(m)
+        m = m.to(device)                                       # BFBatchNorm2d 新建在 CPU，搬回 device
     m = m.eval()
     print(f"[INFO] load {ckpt} (bias_free={bool(bias_free)}):", load_weights_flexible(m, ckpt, device))
     return m
