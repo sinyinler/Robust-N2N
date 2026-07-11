@@ -31,9 +31,13 @@ def natural_key(p: Path):
     return (int(m[0]) if m else 0, p.stem)
 
 
-def load_model(ckpt, device):
-    m = DenoiserWithFeats(input_channels=1).to(device).eval()
-    print(f"[INFO] load {ckpt}:", load_weights_flexible(m, ckpt, device))
+def load_model(ckpt, device, bias_free=False):
+    m = DenoiserWithFeats(input_channels=1).to(device)
+    if bias_free:                                              # bias-free checkpoint 架构不同，须先改造再加载
+        from models.bias_free import make_bias_free
+        make_bias_free(m)
+    m = m.eval()
+    print(f"[INFO] load {ckpt} (bias_free={bool(bias_free)}):", load_weights_flexible(m, ckpt, device))
     return m
 
 
@@ -59,10 +63,10 @@ def main(args):
     print(f"[INFO] reference={args.reference} shape={ref.shape}; 场景={scene} 取前 {len(frames)} 帧 "
           f"(data_range={dr:g})")
 
-    p1, s1, r1 = run_curve(load_model(args.checkpoint, device), frames, ref, dr, device)
+    p1, s1, r1 = run_curve(load_model(args.checkpoint, device, args.bias_free), frames, ref, dr, device)
     have_base = bool(args.baseline_checkpoint)
     if have_base:
-        p0, s0, r0 = run_curve(load_model(args.baseline_checkpoint, device), frames, ref, dr, device)
+        p0, s0, r0 = run_curve(load_model(args.baseline_checkpoint, device, args.baseline_bias_free), frames, ref, dr, device)
 
     # ---- 逐帧 CSV ----
     hdr = "frame,robust_psnr,robust_mssim,robust_r"
@@ -114,6 +118,8 @@ def parse_args():
     p.add_argument("--reference", default="/home/songyd/Projects/Robust-N2N/reference.npy")
     p.add_argument("--max", type=float, default=255.0, help="PSNR/MSSIM 的 data_range")
     p.add_argument("--out_dir", default="results/eval_curve")
+    p.add_argument("--bias_free", type=int, default=0, help="主模型是否 Bias-Free 架构")
+    p.add_argument("--baseline_bias_free", type=int, default=0, help="基线是否 Bias-Free 架构")
     p.add_argument("--device", default="")
     return p.parse_args()
 

@@ -108,6 +108,9 @@ def parse_args() -> argparse.Namespace:
                    help=">0 时启用无 skip 辅助解码器：w_aux·Charb(AuxDec(bridge(n1)), n2)。"
                         "诊断显示 bridge 只承载约 10% 的场景身份信息，纯不变性目标可靠丢信息满足；"
                         "该项强制 bridge 携带可重建整幅图的结构。")
+    p.add_argument("--bias_free", type=int, default=0,
+                   help="1=Bias-Free 改造（去 conv bias / BN→BFBatchNorm / ELA→Identity），"
+                        "使 log 域网络一阶齐次，跨噪声等级泛化（ICLR 2020）。log1p/expm1 保留。")
     args = p.parse_args()
     if args.data_index_min < 0:
         args.data_index_min = None
@@ -127,6 +130,10 @@ def train(args) -> None:
 
     _, train_loader, val_loader = build_loaders(args)
     model = DenoiserWithFeats(input_channels=1).to(device)   # 无 GIBlock
+    if args.bias_free:
+        from models.bias_free import make_bias_free, count_additive_constants
+        make_bias_free(model)
+        print(f"[INFO] Bias-Free 改造完成，残留加性成分={count_additive_constants(model)}（应全 0）")
     if args.data_parallel and torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
 
