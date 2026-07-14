@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt
 
 from infer_eval_robust import load2d, infer, metrics          # 复用同一套加载/推理/指标口径
 from models.denoiser_feats import DenoiserWithFeats
+from models.masked_denoiser import MaskedDenoiserWithFeats
 from utils.checkpoint import load_weights_flexible
 
 
@@ -31,14 +32,16 @@ def natural_key(p: Path):
     return (int(m[0]) if m else 0, p.stem)
 
 
-def load_model(ckpt, device, bias_free=False):
-    m = DenoiserWithFeats(input_channels=1).to(device)
+def load_model(ckpt, device, bias_free=False, masked_model=False):
+    m = (MaskedDenoiserWithFeats(image_channels=1) if masked_model
+         else DenoiserWithFeats(input_channels=1)).to(device)
     if bias_free:                                              # bias-free checkpoint 架构不同，须先改造再加载
         from models.bias_free import make_bias_free
         make_bias_free(m)
         m = m.to(device)                                       # BFBatchNorm2d 新建在 CPU，搬回 device
     m = m.eval()
-    print(f"[INFO] load {ckpt} (bias_free={bool(bias_free)}):", load_weights_flexible(m, ckpt, device))
+    print(f"[INFO] load {ckpt} (bias_free={bool(bias_free)}, masked={bool(masked_model)}):",
+          load_weights_flexible(m, ckpt, device))
     return m
 
 
@@ -64,10 +67,14 @@ def main(args):
     print(f"[INFO] reference={args.reference} shape={ref.shape}; 场景={scene} 取前 {len(frames)} 帧 "
           f"(data_range={dr:g})")
 
-    p1, s1, r1 = run_curve(load_model(args.checkpoint, device, args.bias_free), frames, ref, dr, device)
+    p1, s1, r1 = run_curve(
+        load_model(args.checkpoint, device, args.bias_free, args.masked_model),
+        frames, ref, dr, device)
     have_base = bool(args.baseline_checkpoint)
     if have_base:
-        p0, s0, r0 = run_curve(load_model(args.baseline_checkpoint, device, args.baseline_bias_free), frames, ref, dr, device)
+        p0, s0, r0 = run_curve(
+            load_model(args.baseline_checkpoint, device, args.baseline_bias_free,
+                       args.baseline_masked_model), frames, ref, dr, device)
 
     # ---- 逐帧 CSV ----
     hdr = "frame,robust_psnr,robust_mssim,robust_r"
@@ -90,7 +97,7 @@ def main(args):
         print(f"\n=== N2N baseline（同 {len(frames)} 帧）===")
         stat("PSNR", p0); stat("MSSIM", s0); stat("r", r0)
         d = p1 - p0                                            # 配对差：抵消场景噪声
-        print(f"\n=== 配对 ΔPSNR = Robust - N2N（逐帧）===")
+        print("\n=== 配对 ΔPSNR = candidate - baseline（逐帧）===")
         print(f"  mean={d.mean():+.3f}  std={d.std(ddof=1):.3f}  "
               f"赢={int((d > 0).sum())}/{len(d)} 帧  "
               f"→ {'Robust 稳定更好' if d.mean() > d.std(ddof=1) else '差异在噪声内、分不开'}")
@@ -121,6 +128,10 @@ def parse_args():
     p.add_argument("--out_dir", default="results/eval_curve")
     p.add_argument("--bias_free", type=int, default=0, help="主模型是否 Bias-Free 架构")
     p.add_argument("--baseline_bias_free", type=int, default=0, help="基线是否 Bias-Free 架构")
+    p.add_argument("--masked_model", type=int, default=0,
+                   help="1=主 checkpoint 来自 train_masked.py（模型内部推理时自动补全可见 mask）")
+    p.add_argument("--baseline_masked_model", type=int, default=0,
+                   help="1=基线 checkpoint 也来自 train_masked.py 的双通道公平基线")
     p.add_argument("--device", default="")
     return p.parse_args()
 
