@@ -77,6 +77,66 @@ def update_ema(student: nn.Module, teacher: nn.Module, decay: float) -> None:
         target_buffer.copy_(source_buffers[name])
 
 
+def compute_gradient_diagnostics(
+    student: nn.Module,
+    loss_n2n: torch.Tensor,
+    weighted_feature_loss: torch.Tensor,
+    scales: list[str],
+) -> dict[str, dict[str, float]]:
+    """只读计算两项目标在指定编码层的梯度强度和夹角。
+
+    使用 ``torch.autograd.grad`` 返回临时梯度，不写入参数的 ``.grad``，因此随后执行的
+    ``total.backward()`` 与不开诊断时完全相同。诊断只增加少量计算和显存开销。
+    """
+
+    backbone = unwrap(student)
+    modules = {
+        "encoder1": backbone.encoder.Light_Residual_block_1,
+        "encoder2": backbone.encoder.Light_Residual_block_2,
+        "encoder3": backbone.encoder.Light_Residual_block_3,
+        "bottleneck": backbone.bridge,
+    }
+    unknown = [name for name in scales if name not in modules]
+    if unknown:
+        raise ValueError(f"unknown gradient diagnostic scales: {unknown}")
+
+    output: dict[str, dict[str, float]] = {}
+    for name in scales:
+        parameters = [parameter for parameter in modules[name].parameters() if parameter.requires_grad]
+        grads_n2n = torch.autograd.grad(
+            loss_n2n, parameters, retain_graph=True, allow_unused=True
+        )
+        grads_feature = torch.autograd.grad(
+            weighted_feature_loss, parameters, retain_graph=True, allow_unused=True
+        )
+
+        # 用 float64 累加诊断标量，避免半精度或大特征图导致统计精度不足。
+        device = loss_n2n.device
+        n2n_sq = torch.zeros((), device=device, dtype=torch.float64)
+        feature_sq = torch.zeros((), device=device, dtype=torch.float64)
+        dot = torch.zeros((), device=device, dtype=torch.float64)
+        for grad_n2n, grad_feature in zip(grads_n2n, grads_feature):
+            if grad_n2n is not None:
+                grad_n2n = grad_n2n.detach().to(dtype=torch.float64)
+                n2n_sq = n2n_sq + grad_n2n.square().sum()
+            if grad_feature is not None:
+                grad_feature = grad_feature.detach().to(dtype=torch.float64)
+                feature_sq = feature_sq + grad_feature.square().sum()
+            if grad_n2n is not None and grad_feature is not None:
+                dot = dot + (grad_n2n * grad_feature).sum()
+
+        norm_n2n = n2n_sq.sqrt()
+        norm_feature = feature_sq.sqrt()
+        denominator = (norm_n2n * norm_feature).clamp_min(1e-30)
+        output[name] = {
+            "n2n_norm": float(norm_n2n.cpu()),
+            "weighted_feature_norm": float(norm_feature.cpu()),
+            "feature_to_n2n_ratio": float((norm_feature / norm_n2n.clamp_min(1e-30)).cpu()),
+            "cosine": float((dot / denominator).clamp(-1.0, 1.0).cpu()),
+        }
+    return output
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Masked N2N + masked feature prediction")
     # Data arguments consumed by train_n2n.build_loaders.
@@ -141,6 +201,11 @@ def parse_args() -> argparse.Namespace:
                    help="mask generator seed = seed + offset")
     p.add_argument("--predictor_seed_offset", type=int, default=30_001,
                    help="feature predictor seed = seed + offset，且不推进全局 Torch RNG")
+    p.add_argument("--grad_diag_every", type=int, default=0,
+                   help="每隔多少 optimizer step 记录一次分目标梯度；0=关闭（推荐微调时设 100）")
+    p.add_argument("--grad_diag_scales", nargs="*", default=["encoder2", "encoder3"],
+                   choices=["encoder1", "encoder2", "encoder3", "bottleneck"],
+                   help="梯度诊断作用层；不改变实际 loss 或反向传播")
 
     args = p.parse_args()
     args.data_index_min = None if args.data_index_min < 0 else args.data_index_min
@@ -158,6 +223,10 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("feature_warmup_frac must be non-negative")
     if args.mask_seed_offset < 0 or args.predictor_seed_offset < 0:
         raise ValueError("mask/predictor seed offsets must be non-negative")
+    if args.grad_diag_every < 0:
+        raise ValueError("grad_diag_every must be non-negative")
+    if args.grad_diag_every > 0 and not args.grad_diag_scales:
+        raise ValueError("grad_diag_scales cannot be empty when diagnostics are enabled")
     if args.w_mask_feature > 0 and not args.mask_feature_scales:
         raise ValueError("feature scales cannot be empty when masked feature loss is enabled")
     if args.lambda_conditioned:
@@ -252,10 +321,12 @@ def train(args: argparse.Namespace) -> None:
         f"[INFO] controls: freeze_masked_bn_stats={bool(args.freeze_masked_bn_stats)} "
         f"deterministic_loader_rng={bool(args.deterministic_loader_rng)} "
         f"mask_seed={args.seed + args.mask_seed_offset} "
-        f"predictor_seed={args.seed + args.predictor_seed_offset}"
+        f"predictor_seed={args.seed + args.predictor_seed_offset} "
+        f"grad_diag_every={args.grad_diag_every} grad_diag_scales={args.grad_diag_scales}"
     )
 
     history_path = save_dir / "history.jsonl"
+    grad_diagnostics_path = save_dir / "grad_diagnostics.jsonl"
     global_step = 0
     for epoch in range(1, args.epochs + 1):
         student.train()
@@ -263,7 +334,7 @@ def train(args: argparse.Namespace) -> None:
             feature_loss.train()
         running: dict[str, float] = {}
         pbar = tqdm(train_loader, desc=f"Masked N2N {epoch}/{args.epochs}")
-        for n1, n2 in pbar:
+        for batch_index, (n1, n2) in enumerate(pbar):
             n1 = n1.to(device, non_blocking=True)
             n2 = n2.to(device, non_blocking=True)
             loss_mask_pixel = n1.new_zeros(())
@@ -310,6 +381,32 @@ def train(args: argparse.Namespace) -> None:
             weighted_mask_pixel = args.w_mask_pixel * loss_mask_pixel
             weighted_mask_feature = args.w_mask_feature * ramp * loss_mask_feature
             total = loss_n2n + weighted_rtv + weighted_mask_pixel + weighted_mask_feature
+
+            # 分目标梯度只做低频只读统计：autograd.grad 不写入 parameter.grad，
+            # 因而不会改变下面 total.backward() 的优化结果。
+            if (
+                args.grad_diag_every > 0
+                and feature_loss is not None
+                and weighted_mask_feature.requires_grad
+                and global_step % args.grad_diag_every == 0
+            ):
+                grad_record = {
+                    "epoch": epoch,
+                    "batch": batch_index,
+                    "global_step": global_step,
+                    "ramp": ramp,
+                    "w_mask_feature": args.w_mask_feature,
+                    "loss_n2n": float(loss_n2n.detach()),
+                    "weighted_mask_feature": float(weighted_mask_feature.detach()),
+                    "scales": compute_gradient_diagnostics(
+                        student,
+                        loss_n2n,
+                        weighted_mask_feature,
+                        args.grad_diag_scales,
+                    ),
+                }
+                with grad_diagnostics_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(grad_record, ensure_ascii=False) + "\n")
 
             optimizer.zero_grad(set_to_none=True)
             total.backward()

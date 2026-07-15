@@ -20,7 +20,11 @@ from losses.masked_prediction import (
     make_block_visible_mask,
     masked_charbonnier,
 )
-from train_masked import suspend_batchnorm_running_stats, update_ema
+from train_masked import (
+    compute_gradient_diagnostics,
+    suspend_batchnorm_running_stats,
+    update_ema,
+)
 
 
 def main(device_name: str) -> None:
@@ -87,7 +91,17 @@ def main(device_name: str) -> None:
         [teacher_feats[1], teacher_feats[2]],
         visible,
     )
-    loss = (y_normal - n2).abs().mean() + loss_pixel + 0.05 * loss_feature
+    loss_n2n = (y_normal - n2).abs().mean()
+    weighted_feature = 0.05 * loss_feature
+    diagnostics = compute_gradient_diagnostics(
+        student, loss_n2n, weighted_feature, ["encoder2", "encoder3"]
+    )
+    assert all(item["n2n_norm"] > 0 for item in diagnostics.values())
+    assert all(item["weighted_feature_norm"] > 0 for item in diagnostics.values())
+    # autograd.grad 只能返回临时张量，不能提前污染 optimizer 将使用的 parameter.grad。
+    assert all(parameter.grad is None for parameter in student.parameters())
+
+    loss = loss_n2n + loss_pixel + weighted_feature
     loss.backward()
     assert torch.isfinite(loss)
     assert any(p.grad is not None and torch.isfinite(p.grad).all() for p in student.parameters())
@@ -102,7 +116,8 @@ def main(device_name: str) -> None:
     print(
         f"[OK] masked smoke device={device} hidden={hidden_ratio:.3f} "
         f"pixel={float(loss_pixel):.4f} feature={float(loss_feature):.4f} "
-        f"per_scale={[round(x, 4) for x in per_scale]}"
+        f"per_scale={[round(x, 4) for x in per_scale]} "
+        f"grad_ratio_e2={diagnostics['encoder2']['feature_to_n2n_ratio']:.4f}"
     )
 
 

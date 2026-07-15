@@ -151,3 +151,36 @@
   `results/checkpoints/maskfix_*`。
 - 修正后结果：待服务器重新训练并回填指标；必须同时检查
   `results/eval_ood/maskfix_D_s42/compare/` 的全图与细血管局部放大，不能只凭 PSNR/SSIM 下结论。
+
+## 2026-07-15 Masked feature 微调阶段 0：epoch 曲线与梯度诊断
+
+- 目的：在改变 feature weight、mask ratio 或 projector 前，先用现有 A/C checkpoint 判断 3 epoch 是否训练充分，
+  并测量 N2N 与 masked feature 两项目标在 Encoder2/3 上的真实梯度强度和方向，避免只按 loss 标量猜权重。
+- 本条所在提交新增 `eval_masked_epochs.py`：统一评估 A-base/C-feature 的 seed=42/187/2413、epoch=1/2/3，
+  固定使用同一 level4 场景前 50 帧和同一 reference；输出逐帧 CSV、seed/epoch 汇总、跨 seed epoch 曲线、
+  paired bootstrap 95% CI，以及同窗宽全图/中心局部放大。ID test 曲线只作学习过程诊断，checkpoint 选择仍以
+  `history.jsonl` 的 validation loss 为先，避免用 test PSNR 直接选 epoch。
+- `train_masked.py` 新增可选 `--grad_diag_every` 和 `--grad_diag_scales`。诊断通过 `torch.autograd.grad`
+  临时读取梯度，不写入参数 `.grad`，记录到每次训练目录的 `grad_diagnostics.jsonl`；默认关闭，后续微调命令
+  显式使用 `--grad_diag_every 100 --grad_diag_scales encoder2 encoder3`。新增
+  `scripts/summarize_grad_diagnostics.py`，默认排除 warmup（`ramp<0.99`），汇总 feature/N2N 梯度范数比、
+  梯度余弦、负余弦比例和强冲突（默认 cosine<-0.2）比例。
+- 第一阶段服务器评估命令：
+
+  ```bash
+  python eval_masked_epochs.py \
+    --checkpoint_root results/checkpoints \
+    --a_dir_template 'maskfix_A_base_s{seed}' \
+    --c_dir_template 'maskfix_C_feature_s{seed}' \
+    --seeds 42 187 2413 \
+    --epochs 1 2 3 \
+    --scene_dir /mnt2/songyd/5x5/5x5x4/0/npy \
+    --reference /home/songyd/Projects/Robust-N2N/reference.npy \
+    --n_frames 50 \
+    --max_vis_frames 1 \
+    --device cuda \
+    --out_dir results/eval_id/maskfix_epoch_sweep
+  ```
+
+- 结果：待服务器执行后回填 `results/eval_id/maskfix_epoch_sweep/summary.json`、`epoch_summary.csv` 和
+  `compare/` 的视觉结论；确认 epoch 3 是否仍改善后，才进入第一个单变量微调。
