@@ -184,3 +184,22 @@
 
 - 结果：待服务器执行后回填 `results/eval_id/maskfix_epoch_sweep/summary.json`、`epoch_summary.csv` 和
   `compare/` 的视觉结论；确认 epoch 3 是否仍改善后，才进入第一个单变量微调。
+
+## 2026-07-15 Masked feature 微调阶段 1：seed42、5 epoch、加入原始 N2N
+
+- 阶段 0 结果：A/C 三 seed 在 epoch3 的 ID 配对增益为 `+0.226±0.023 dB`，三个 seed 分别
+  `+0.214/+0.252/+0.212 dB`，总胜出 `127/150` 帧；跨 seed MSSIM `+0.00130`、Pearson r
+  `+0.00251`。A/C 六条 validation 曲线从 epoch2 到 epoch3 全部继续下降，因此先验证 5 epoch，
+  暂不调 feature weight，也不加 projector。
+- 本轮只跑 seed42，但同时从头训练三组：
+  1. Original：`train_n2n.py` 单通道网络、原始 N2N loss/optimizer 配方，`weight_decay=0.01`；
+  2. A-base：双通道 all-visible 公平基线，`weight_decay=1e-4`；
+  3. C-feature：A-base + masked feature prediction，`weight_decay=1e-4`。
+- 解释边界：`C-A` 隔离 feature-loss；`C-Original` 回答相对原始系统的实际净提升；`A-Original`
+  量化双通道/trainer/weight-decay 等非 feature 因素，三者不可互相替代。三组都固定 level4、crop512、
+  batch16、seed42、同一独立 DataLoader RNG 和 5 epoch OneCycle；5-epoch OneCycle 会重定义整个学习率轨迹，
+  因此必须从头训练，不能把旧 3-epoch checkpoint 直接续两轮。
+- 实现：`train_n2n.py` 新增显式 `--weight_decay`、`--deterministic_loader_rng` 和 `history.jsonl`；
+  `train_masked.py` 将既有 `1e-4` 暴露为参数但默认行为不变；`eval_masked_epochs.py` 新增可选
+  `--original_dir_template`，同帧输出 Original/A/C 指标、C-A、C-Original、A-Original、bootstrap CI
+  及五列同窗宽局部放大图。结果待服务器训练后回填。

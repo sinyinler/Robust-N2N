@@ -175,6 +175,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr_final", type=float, default=0.0005)
     p.add_argument("--warmup_pct", type=float, default=0.1)
     p.add_argument("--rtv_weight", type=float, default=0.01)
+    p.add_argument("--weight_decay", type=float, default=1e-4,
+                   help="AdamW weight decay；默认保持 masked A/C 既有配方")
     p.add_argument("--charb_eps", type=float, default=1e-3)
     p.add_argument("--grad_clip", type=float, default=0.0)
     p.add_argument("--data_parallel", type=int, default=1)
@@ -217,6 +219,8 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("mask_ratio must be in [0,1) and mask_patch must be positive")
     if args.w_mask_pixel < 0 or args.w_mask_feature < 0:
         raise ValueError("masked loss weights must be non-negative")
+    if args.weight_decay < 0:
+        raise ValueError("weight_decay must be non-negative")
     if not 0.0 <= args.ema_decay < 1.0:
         raise ValueError("ema_decay must be in [0,1)")
     if args.feature_warmup_frac < 0:
@@ -300,7 +304,7 @@ def train(args: argparse.Namespace) -> None:
     charb = CharbonnierLoss(eps=args.charb_eps).to(device)
     rtv = RTVRegularizer(radius=2, sigma=2.0, eps=1e-3).to(device)
     trainable = list(student.parameters()) + (list(feature_loss.parameters()) if feature_loss is not None else [])
-    optimizer = optim.AdamW(trainable, lr=args.lr_max, weight_decay=1e-4)
+    optimizer = optim.AdamW(trainable, lr=args.lr_max, weight_decay=args.weight_decay)
     scheduler = build_onecycle(optimizer, len(train_loader), args)
 
     total_steps = max(1, args.epochs * len(train_loader))
@@ -320,6 +324,7 @@ def train(args: argparse.Namespace) -> None:
     print(
         f"[INFO] controls: freeze_masked_bn_stats={bool(args.freeze_masked_bn_stats)} "
         f"deterministic_loader_rng={bool(args.deterministic_loader_rng)} "
+        f"weight_decay={args.weight_decay} "
         f"mask_seed={args.seed + args.mask_seed_offset} "
         f"predictor_seed={args.seed + args.predictor_seed_offset} "
         f"grad_diag_every={args.grad_diag_every} grad_diag_scales={args.grad_diag_scales}"

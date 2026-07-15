@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""批量评估 Masked N2N 的 A/C 多 seed、多 epoch checkpoint。
+"""批量评估 Original N2N（可选）与 Masked N2N A/C 的多 seed、多 epoch checkpoint。
 
 本脚本固定使用同一组 level4 帧和同一 reference，逐帧计算 A-base 与
-C-feature 的 PSNR/MSSIM/Pearson r，并输出：
+C-feature 的 PSNR/MSSIM/Pearson r，并输出 C-A；传入原始 N2N 模板后还输出
+C-Original 与 A-Original，从而把 feature-loss 收益和训练框架差异分开。
 
 - ``seed_epoch_summary.csv``：每个 seed/epoch 的均值、标准差与配对增益；
 - ``epoch_summary.csv``：跨 seed 的 epoch 曲线；
@@ -32,6 +33,7 @@ import torch
 from PIL import Image, ImageDraw, ImageFont
 
 from infer_eval_robust import infer, load2d, metrics
+from models.denoiser import Denoiser
 from models.masked_denoiser import MaskedDenoiserWithFeats
 from utils.checkpoint import load_weights_flexible
 
@@ -89,6 +91,24 @@ def bootstrap_mean_ci(values, repeats: int, seed: int) -> tuple[float, float] | 
     return float(low), float(high)
 
 
+def paired_summary(
+    candidate: dict[str, np.ndarray],
+    baseline: dict[str, np.ndarray],
+    bootstrap_repeats: int,
+    bootstrap_seed: int,
+) -> dict:
+    """汇总同帧 candidate-baseline；PSNR 同时给 bootstrap 置信区间和胜出数。"""
+
+    deltas = {key: candidate[key] - baseline[key] for key in ("psnr", "mssim", "r")}
+    ci = bootstrap_mean_ci(deltas["psnr"], bootstrap_repeats, bootstrap_seed)
+    return {
+        **{key: summary_stats(value) for key, value in deltas.items()},
+        "psnr_bootstrap_95ci": list(ci) if ci is not None else None,
+        "psnr_wins": int((deltas["psnr"] > 0).sum()),
+        "n_frames": int(deltas["psnr"].size),
+    }
+
+
 def evaluate_checkpoint(
     checkpoint: Path,
     frames: list[np.ndarray],
@@ -97,10 +117,14 @@ def evaluate_checkpoint(
     device: torch.device,
     max_vis_frames: int,
     strict_load: bool,
+    masked_model: bool = True,
 ) -> tuple[dict[str, np.ndarray], list[np.ndarray], dict[str, int]]:
-    """一次加载一个模型，避免 18 个 checkpoint 同时占用 GPU 内存。"""
+    """一次加载一个模型，避免多个 checkpoint 同时占用 GPU 内存。"""
 
-    model = MaskedDenoiserWithFeats(image_channels=1).to(device).eval()
+    model = (
+        MaskedDenoiserWithFeats(image_channels=1)
+        if masked_model else Denoiser(input_channels=1)
+    ).to(device).eval()
     load_info = load_weights_flexible(model, str(checkpoint), device)
     if strict_load and (load_info["loaded"] <= 0 or load_info["skipped"] != 0):
         raise RuntimeError(f"checkpoint 未完整加载：{checkpoint} -> {load_info}")
@@ -150,10 +174,14 @@ def save_comparison(
     reference: np.ndarray,
     path: Path,
     zoom_size: int,
+    original: np.ndarray | None = None,
 ) -> None:
     """保存同窗宽全图与中心局部放大，检查细小结构是否被磨平。"""
 
-    named = [("noisy", raw), ("A-base", arm_a), ("C-feature", arm_c), ("reference", reference)]
+    named = [("noisy", raw)]
+    if original is not None:
+        named.append(("Original N2N", original))
+    named.extend([("A-base", arm_a), ("C-feature", arm_c), ("reference", reference)])
     height = min(array.shape[0] for _, array in named)
     width = min(array.shape[1] for _, array in named)
     named = [(name, center_crop(array, height, width)) for name, array in named]
@@ -189,8 +217,16 @@ def save_comparison(
 
 
 def checkpoint_path(args, arm: str, seed: int, epoch: int) -> Path:
-    template = args.a_dir_template if arm == "A" else args.c_dir_template
-    directory = Path(args.checkpoint_root) / template.format(seed=seed)
+    if arm == "A":
+        root, template = args.checkpoint_root, args.a_dir_template
+    elif arm == "C":
+        root, template = args.checkpoint_root, args.c_dir_template
+    elif arm == "O":
+        root = args.original_checkpoint_root or args.checkpoint_root
+        template = args.original_dir_template
+    else:
+        raise ValueError(f"unknown arm: {arm}")
+    directory = Path(root) / template.format(seed=seed)
     return directory / f"model_epoch_{epoch}.pth"
 
 
@@ -210,8 +246,16 @@ def plot_epoch_curves(epoch_rows: list[dict], path: Path) -> None:
     c_std = np.asarray([row["c_psnr_seed_std"] for row in epoch_rows])
     delta = np.asarray([row["delta_psnr_mean"] for row in epoch_rows])
     delta_std = np.asarray([row["delta_psnr_seed_std"] for row in epoch_rows])
+    have_original = "original_psnr_mean" in epoch_rows[0]
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), dpi=150)
+    if have_original:
+        original_psnr = np.asarray([row["original_psnr_mean"] for row in epoch_rows])
+        original_std = np.asarray([row["original_psnr_seed_std"] for row in epoch_rows])
+        axes[0].errorbar(
+            epochs, original_psnr, yerr=original_std, marker="o", capsize=3,
+            label="Original N2N",
+        )
     axes[0].errorbar(epochs, a_psnr, yerr=a_std, marker="o", capsize=3, label="A-base")
     axes[0].errorbar(epochs, c_psnr, yerr=c_std, marker="o", capsize=3, label="C-feature")
     axes[0].set_xlabel("epoch")
@@ -221,11 +265,24 @@ def plot_epoch_curves(epoch_rows: list[dict], path: Path) -> None:
     axes[0].legend()
 
     axes[1].axhline(0.0, color="black", linewidth=1)
-    axes[1].errorbar(epochs, delta, yerr=delta_std, marker="o", capsize=3, color="#D4537E")
+    axes[1].errorbar(
+        epochs, delta, yerr=delta_std, marker="o", capsize=3,
+        color="#D4537E", label="C - A",
+    )
+    if have_original:
+        delta_original = np.asarray([row["delta_c_original_psnr_mean"] for row in epoch_rows])
+        delta_original_std = np.asarray([
+            row["delta_c_original_psnr_seed_std"] for row in epoch_rows
+        ])
+        axes[1].errorbar(
+            epochs, delta_original, yerr=delta_original_std, marker="s", capsize=3,
+            color="#378ADD", label="C - Original",
+        )
     axes[1].set_xlabel("epoch")
     axes[1].set_ylabel("C - A PSNR (dB)")
     axes[1].set_title("paired gain across seeds")
     axes[1].grid(alpha=0.3)
+    axes[1].legend()
     for x, y in zip(epochs, delta):
         axes[1].annotate(f"{y:+.3f}", (x, y), textcoords="offset points", xytext=(0, 7), ha="center")
 
@@ -242,9 +299,11 @@ def main(args: argparse.Namespace) -> None:
     if not frame_paths:
         raise FileNotFoundError(f"{scene_dir} 下未找到 .npy 帧")
 
+    have_original = bool(args.original_dir_template)
+    evaluated_arms = ("A", "C", "O") if have_original else ("A", "C")
     missing = [
         checkpoint_path(args, arm, seed, epoch)
-        for seed in args.seeds for epoch in args.epochs for arm in ("A", "C")
+        for seed in args.seeds for epoch in args.epochs for arm in evaluated_arms
         if not checkpoint_path(args, arm, seed, epoch).is_file()
     ]
     if missing:
@@ -266,7 +325,14 @@ def main(args: argparse.Namespace) -> None:
         for epoch in args.epochs:
             ckpt_a = checkpoint_path(args, "A", seed, epoch)
             ckpt_c = checkpoint_path(args, "C", seed, epoch)
+            ckpt_original = checkpoint_path(args, "O", seed, epoch) if have_original else None
             print(f"\n========== seed={seed} epoch={epoch} ==========")
+            original_metrics = original_visuals = load_original = None
+            if ckpt_original is not None:
+                original_metrics, original_visuals, load_original = evaluate_checkpoint(
+                    ckpt_original, frames, reference, args.max, device,
+                    args.max_vis_frames, bool(args.strict_load), masked_model=False,
+                )
             a_metrics, a_visuals, load_a = evaluate_checkpoint(
                 ckpt_a, frames, reference, args.max, device,
                 args.max_vis_frames, bool(args.strict_load),
@@ -276,11 +342,8 @@ def main(args: argparse.Namespace) -> None:
                 args.max_vis_frames, bool(args.strict_load),
             )
 
-            delta_psnr = c_metrics["psnr"] - a_metrics["psnr"]
-            delta_mssim = c_metrics["mssim"] - a_metrics["mssim"]
-            delta_r = c_metrics["r"] - a_metrics["r"]
-            ci = bootstrap_mean_ci(
-                delta_psnr,
+            delta = paired_summary(
+                c_metrics, a_metrics,
                 args.bootstrap_repeats,
                 args.bootstrap_seed + seed * 100 + epoch,
             )
@@ -296,52 +359,93 @@ def main(args: argparse.Namespace) -> None:
                 "val_c": load_validation_loss(ckpt_c, epoch),
                 "a": {key: summary_stats(values) for key, values in a_metrics.items()},
                 "c": {key: summary_stats(values) for key, values in c_metrics.items()},
-                "delta": {
-                    "psnr": summary_stats(delta_psnr),
-                    "mssim": summary_stats(delta_mssim),
-                    "r": summary_stats(delta_r),
-                    "psnr_bootstrap_95ci": list(ci) if ci is not None else None,
-                    "psnr_wins": int((delta_psnr > 0).sum()),
-                    "n_frames": int(delta_psnr.size),
-                },
+                "delta": delta,
             }
+            if original_metrics is not None and ckpt_original is not None:
+                record.update({
+                    "checkpoint_original": str(ckpt_original),
+                    "load_original": load_original,
+                    "val_original": load_validation_loss(ckpt_original, epoch),
+                    "original": {
+                        key: summary_stats(values) for key, values in original_metrics.items()
+                    },
+                    "delta_c_original": paired_summary(
+                        c_metrics, original_metrics, args.bootstrap_repeats,
+                        args.bootstrap_seed + 1_000_000 + seed * 100 + epoch,
+                    ),
+                    "delta_a_original": paired_summary(
+                        a_metrics, original_metrics, args.bootstrap_repeats,
+                        args.bootstrap_seed + 2_000_000 + seed * 100 + epoch,
+                    ),
+                })
             seed_epoch_records.append(record)
 
+            prefix = (
+                f"Original={record['original']['psnr']['mean']:.3f}/"
+                f"{record['original']['mssim']['mean']:.4f} "
+                if "original" in record else ""
+            )
+            suffix = (
+                f" C-Original={record['delta_c_original']['psnr']['mean']:+.3f} dB"
+                if "delta_c_original" in record else ""
+            )
             print(
-                f"A={record['a']['psnr']['mean']:.3f}/{record['a']['mssim']['mean']:.4f} "
+                prefix
+                + f"A={record['a']['psnr']['mean']:.3f}/{record['a']['mssim']['mean']:.4f} "
                 f"C={record['c']['psnr']['mean']:.3f}/{record['c']['mssim']['mean']:.4f} "
-                f"delta={record['delta']['psnr']['mean']:+.3f} dB "
+                f"C-A={record['delta']['psnr']['mean']:+.3f} dB "
                 f"wins={record['delta']['psnr_wins']}/{len(frames)}"
+                + suffix
             )
 
             for index, frame_path in enumerate(frame_paths):
-                per_frame_rows.append({
+                frame_row = {
                     "seed": seed,
                     "epoch": epoch,
                     "frame": frame_path.stem,
                     "frame_path": str(frame_path),
                     "a_psnr": float(a_metrics["psnr"][index]),
                     "c_psnr": float(c_metrics["psnr"][index]),
-                    "delta_psnr": float(delta_psnr[index]),
+                    "delta_psnr": float(c_metrics["psnr"][index] - a_metrics["psnr"][index]),
                     "a_mssim": float(a_metrics["mssim"][index]),
                     "c_mssim": float(c_metrics["mssim"][index]),
-                    "delta_mssim": float(delta_mssim[index]),
+                    "delta_mssim": float(c_metrics["mssim"][index] - a_metrics["mssim"][index]),
                     "a_r": float(a_metrics["r"][index]),
                     "c_r": float(c_metrics["r"][index]),
-                    "delta_r": float(delta_r[index]),
-                })
+                    "delta_r": float(c_metrics["r"][index] - a_metrics["r"][index]),
+                }
+                if original_metrics is not None:
+                    frame_row.update({
+                        "original_psnr": float(original_metrics["psnr"][index]),
+                        "delta_c_original_psnr": float(
+                            c_metrics["psnr"][index] - original_metrics["psnr"][index]
+                        ),
+                        "delta_a_original_psnr": float(
+                            a_metrics["psnr"][index] - original_metrics["psnr"][index]
+                        ),
+                        "original_mssim": float(original_metrics["mssim"][index]),
+                        "delta_c_original_mssim": float(
+                            c_metrics["mssim"][index] - original_metrics["mssim"][index]
+                        ),
+                        "original_r": float(original_metrics["r"][index]),
+                        "delta_c_original_r": float(
+                            c_metrics["r"][index] - original_metrics["r"][index]
+                        ),
+                    })
+                per_frame_rows.append(frame_row)
 
             for index, (a_output, c_output) in enumerate(zip(a_visuals, c_visuals)):
                 save_comparison(
                     frames[index], a_output, c_output, reference,
                     out_dir / "compare" / f"seed{seed}_epoch{epoch}_{frame_paths[index].stem}.png",
                     args.zoom_size,
+                    None if original_visuals is None else original_visuals[index],
                 )
 
     seed_epoch_csv = []
     for record in seed_epoch_records:
         ci = record["delta"]["psnr_bootstrap_95ci"]
-        seed_epoch_csv.append({
+        csv_row = {
             "seed": record["seed"],
             "epoch": record["epoch"],
             "val_a": record["val_a"],
@@ -360,7 +464,24 @@ def main(args: argparse.Namespace) -> None:
             "a_r_mean": record["a"]["r"]["mean"],
             "c_r_mean": record["c"]["r"]["mean"],
             "delta_r_mean": record["delta"]["r"]["mean"],
-        })
+        }
+        if "original" in record:
+            ci_original = record["delta_c_original"]["psnr_bootstrap_95ci"]
+            csv_row.update({
+                "val_original": record["val_original"],
+                "original_psnr_mean": record["original"]["psnr"]["mean"],
+                "original_mssim_mean": record["original"]["mssim"]["mean"],
+                "original_r_mean": record["original"]["r"]["mean"],
+                "delta_c_original_psnr_mean": record["delta_c_original"]["psnr"]["mean"],
+                "delta_c_original_psnr_std": record["delta_c_original"]["psnr"]["std"],
+                "delta_c_original_ci_low": None if ci_original is None else ci_original[0],
+                "delta_c_original_ci_high": None if ci_original is None else ci_original[1],
+                "c_original_psnr_wins": record["delta_c_original"]["psnr_wins"],
+                "delta_a_original_psnr_mean": record["delta_a_original"]["psnr"]["mean"],
+                "delta_c_original_mssim_mean": record["delta_c_original"]["mssim"]["mean"],
+                "delta_c_original_r_mean": record["delta_c_original"]["r"]["mean"],
+            })
+        seed_epoch_csv.append(csv_row)
 
     epoch_records: list[dict] = []
     for epoch in args.epochs:
@@ -370,7 +491,7 @@ def main(args: argparse.Namespace) -> None:
         delta_psnr = [record["delta"]["psnr"]["mean"] for record in selected]
         valid_a = [record["val_a"] for record in selected if record["val_a"] is not None]
         valid_c = [record["val_c"] for record in selected if record["val_c"] is not None]
-        epoch_records.append({
+        epoch_record = {
             "epoch": epoch,
             "a_psnr_mean": float(np.mean(a_psnr)),
             "a_psnr_seed_std": sample_std(a_psnr),
@@ -384,7 +505,29 @@ def main(args: argparse.Namespace) -> None:
             "c_val_mean": None if not valid_c else float(np.mean(valid_c)),
             "total_wins": int(sum(record["delta"]["psnr_wins"] for record in selected)),
             "total_frame_comparisons": int(sum(record["delta"]["n_frames"] for record in selected)),
-        })
+        }
+        if have_original:
+            original_psnr = [record["original"]["psnr"]["mean"] for record in selected]
+            delta_c_original = [
+                record["delta_c_original"]["psnr"]["mean"] for record in selected
+            ]
+            valid_original = [
+                record["val_original"] for record in selected
+                if record["val_original"] is not None
+            ]
+            epoch_record.update({
+                "original_psnr_mean": float(np.mean(original_psnr)),
+                "original_psnr_seed_std": sample_std(original_psnr),
+                "original_val_mean": (
+                    None if not valid_original else float(np.mean(valid_original))
+                ),
+                "delta_c_original_psnr_mean": float(np.mean(delta_c_original)),
+                "delta_c_original_psnr_seed_std": sample_std(delta_c_original),
+                "c_original_total_wins": int(sum(
+                    record["delta_c_original"]["psnr_wins"] for record in selected
+                )),
+            })
+        epoch_records.append(epoch_record)
 
     write_csv(
         out_dir / "per_frame.csv", per_frame_rows,
@@ -411,6 +554,8 @@ def main(args: argparse.Namespace) -> None:
             "epochs": list(args.epochs),
             "a_dir_template": args.a_dir_template,
             "c_dir_template": args.c_dir_template,
+            "original_checkpoint_root": args.original_checkpoint_root,
+            "original_dir_template": args.original_dir_template,
         },
         "epoch_summary": epoch_records,
         "seed_epoch_summary": seed_epoch_records,
@@ -420,24 +565,45 @@ def main(args: argparse.Namespace) -> None:
     )
 
     print("\n========== 跨 seed epoch 汇总 ==========")
-    print(f"{'epoch':>5} | {'A PSNR':>8} | {'C PSNR':>8} | {'C-A':>8} | {'wins':>9} | {'A val':>9} | {'C val':>9}")
-    print("-" * 76)
+    if have_original:
+        print(
+            f"{'epoch':>5} | {'Original':>8} | {'A PSNR':>8} | {'C PSNR':>8} | "
+            f"{'C-A':>8} | {'C-Orig':>8} | {'wins C/A':>9} | {'wins C/O':>9}"
+        )
+        print("-" * 96)
+    else:
+        print(f"{'epoch':>5} | {'A PSNR':>8} | {'C PSNR':>8} | {'C-A':>8} | {'wins':>9} | {'A val':>9} | {'C val':>9}")
+        print("-" * 76)
     for row in epoch_records:
         a_val = "n/a" if row["a_val_mean"] is None else f"{row['a_val_mean']:.5f}"
         c_val = "n/a" if row["c_val_mean"] is None else f"{row['c_val_mean']:.5f}"
-        print(
-            f"{row['epoch']:>5} | {row['a_psnr_mean']:>8.3f} | {row['c_psnr_mean']:>8.3f} | "
-            f"{row['delta_psnr_mean']:>+8.3f} | "
-            f"{row['total_wins']:>3}/{row['total_frame_comparisons']:<5} | {a_val:>9} | {c_val:>9}"
-        )
+        if have_original:
+            print(
+                f"{row['epoch']:>5} | {row['original_psnr_mean']:>8.3f} | "
+                f"{row['a_psnr_mean']:>8.3f} | {row['c_psnr_mean']:>8.3f} | "
+                f"{row['delta_psnr_mean']:>+8.3f} | "
+                f"{row['delta_c_original_psnr_mean']:>+8.3f} | "
+                f"{row['total_wins']:>3}/{row['total_frame_comparisons']:<5} | "
+                f"{row['c_original_total_wins']:>3}/{row['total_frame_comparisons']:<5}"
+            )
+        else:
+            print(
+                f"{row['epoch']:>5} | {row['a_psnr_mean']:>8.3f} | {row['c_psnr_mean']:>8.3f} | "
+                f"{row['delta_psnr_mean']:>+8.3f} | "
+                f"{row['total_wins']:>3}/{row['total_frame_comparisons']:<5} | {a_val:>9} | {c_val:>9}"
+            )
     print(f"\n[OK] 汇总与曲线写入 {out_dir}")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="A/C 多 seed、多 epoch 的 ID 配对评估")
+    parser = argparse.ArgumentParser(description="Original/A/C 多 seed、多 epoch 的 ID 配对评估")
     parser.add_argument("--checkpoint_root", default="results/checkpoints")
     parser.add_argument("--a_dir_template", default="maskfix_A_base_s{seed}")
     parser.add_argument("--c_dir_template", default="maskfix_C_feature_s{seed}")
+    parser.add_argument("--original_checkpoint_root", default="",
+                        help="原始 N2N checkpoint 根目录；空则复用 checkpoint_root")
+    parser.add_argument("--original_dir_template", default="",
+                        help="如 n2n_original_E5_s{seed}；空=保持旧版 A/C 双模型评估")
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 187, 2413])
     parser.add_argument("--epochs", type=int, nargs="+", default=[1, 2, 3])
     parser.add_argument("--scene_dir", default="/mnt2/songyd/5x5/5x5x4/0/npy")
