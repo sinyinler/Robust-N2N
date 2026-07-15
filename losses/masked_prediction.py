@@ -18,6 +18,7 @@ def make_block_visible_mask(
     *,
     device,
     dtype,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """Return ``(N,1,H,W)`` with 1=visible and 0=hidden block patches.
 
@@ -37,7 +38,8 @@ def make_block_visible_mask(
     gw = math.ceil(width / patch)
     cells = gh * gw
     hidden_cells = min(cells - 1, max(1, int(round(cells * ratio))))
-    scores = torch.rand((batch, cells), device=device)
+    # 使用独立 generator，避免 predictor 初始化或 DataLoader shuffle 改变 mask 序列。
+    scores = torch.rand((batch, cells), device=device, generator=generator)
     hidden_idx = scores.topk(hidden_cells, dim=1, largest=True, sorted=False).indices
     hidden_grid = torch.zeros((batch, cells), device=device, dtype=dtype)
     hidden_grid.scatter_(1, hidden_idx, 1.0)

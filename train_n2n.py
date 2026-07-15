@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import random
 import sys
 from collections import defaultdict
@@ -153,12 +152,25 @@ def build_multisource_loaders(args):
                                         generator=torch.Generator().manual_seed(args.seed))
     else:
         train_ds, val_ds = view, None
+    # Masked 消融可启用 DataLoader 独立 RNG，避免模型/predictor/mask 的随机数
+    # 悄悄改变样本顺序或 worker 随机裁剪。
+    deterministic_loader_rng = bool(getattr(args, "deterministic_loader_rng", 0))
+    train_generator = (
+        torch.Generator().manual_seed(args.seed + 10_001)
+        if deterministic_loader_rng else None
+    )
+    val_generator = (
+        torch.Generator().manual_seed(args.seed + 10_002)
+        if deterministic_loader_rng else None
+    )
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=True,
-                              prefetch_factor=2 if args.num_workers > 0 else None)
+                              prefetch_factor=2 if args.num_workers > 0 else None,
+                              generator=train_generator)
     val_loader = None if val_ds is None else DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.val_num_workers, pin_memory=True)
+        num_workers=args.val_num_workers, pin_memory=True,
+        generator=val_generator)
     print(f"[INFO] multi-source N2N: {total} samples (crop={crop}, 5x5 levels={args.levels}, "
           f"mix_root={args.mix_root}, mix_scenes={args.mix_scenes})")
     return base, train_loader, val_loader
@@ -200,6 +212,16 @@ def build_loaders(args):
     else:
         train_dataset, val_dataset = full_dataset, None
 
+    deterministic_loader_rng = bool(getattr(args, "deterministic_loader_rng", 0))
+    train_generator = (
+        torch.Generator().manual_seed(args.seed + 10_001)
+        if deterministic_loader_rng else None
+    )
+    val_generator = (
+        torch.Generator().manual_seed(args.seed + 10_002)
+        if deterministic_loader_rng else None
+    )
+
     if args.crop_size <= 0:
         max_pixels_per_batch = args.max_pixels_per_batch or args.batch_size * args.batch_ref_size * args.batch_ref_size
         train_loader = DataLoader(
@@ -208,12 +230,14 @@ def build_loaders(args):
             num_workers=args.num_workers,
             pin_memory=True,
             prefetch_factor=2 if args.num_workers > 0 else None,
+            generator=train_generator,
         )
         val_loader = None if val_dataset is None else DataLoader(
             val_dataset,
             batch_sampler=ShapeBatchSampler(val_dataset, args.batch_size, shuffle=False, seed=args.seed + 1, max_pixels_per_batch=max_pixels_per_batch),
             num_workers=args.val_num_workers,
             pin_memory=True,
+            generator=val_generator,
         )
     else:
         train_loader = DataLoader(
@@ -223,6 +247,7 @@ def build_loaders(args):
             num_workers=args.num_workers,
             pin_memory=True,
             prefetch_factor=2 if args.num_workers > 0 else None,
+            generator=train_generator,
         )
         val_loader = None if val_dataset is None else DataLoader(
             val_dataset,
@@ -230,6 +255,7 @@ def build_loaders(args):
             shuffle=False,
             num_workers=args.val_num_workers,
             pin_memory=True,
+            generator=val_generator,
         )
     return full_dataset, train_loader, val_loader
 

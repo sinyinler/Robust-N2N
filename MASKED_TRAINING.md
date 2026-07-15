@@ -15,6 +15,22 @@ The model receives image + visibility-mask channels. At inference the wrapper
 automatically supplies an all-visible mask, so evaluation still calls
 `model(image)`.
 
+## Corrected experimental controls (2026-07-15)
+
+The first seed-42 pilot exposed two confounders and an overweight auxiliary
+pixel objective. The corrected path now:
+
+- prevents the masked forward from updating persistent BatchNorm running
+  statistics while retaining batch statistics and BN affine gradients;
+- gives DataLoader/worker sampling, mask generation, and predictor initialization
+  independent seeded RNGs without advancing the shared Torch RNG;
+- logs both raw and actually weighted RTV/pixel/feature losses;
+- uses `w_mask_pixel=0.1` as the pilot default instead of `1.0`.
+
+The old `mask_A/B/C/D_*` results must not be mixed with corrected runs. Retrain
+all four arms, including A, under the corrected RNG control and use the
+`maskfix_*` output directories below.
+
 ## 1. Get the branch on the training server
 
 ```bash
@@ -46,27 +62,27 @@ checkpoint.
 
 ```bash
 DATA=/mnt2/songyd/5x5
-COMMON="--data_path $DATA --levels 4 --epochs 3 --crop_size 512 --batch_size 16 --lr 0.01 --rtv_weight 0.01 --mask_ratio 0.25 --mask_patch 16 --seed 42"
+COMMON="--data_path $DATA --levels 4 --epochs 3 --crop_size 512 --batch_size 16 --lr 0.01 --rtv_weight 0.01 --mask_ratio 0.25 --mask_patch 16 --freeze_masked_bn_stats 1 --deterministic_loader_rng 1 --seed 42"
 
 # A: fair two-channel N2N baseline
 python train_masked.py $COMMON \
   --w_mask_pixel 0 --w_mask_feature 0 \
-  --save_dir results/checkpoints/mask_A_base_s42
+  --save_dir results/checkpoints/maskfix_A_base_s42
 
 # B: masked-pixel reconstruction only
 python train_masked.py $COMMON \
-  --w_mask_pixel 1 --w_mask_feature 0 \
-  --save_dir results/checkpoints/mask_B_pixel_s42
+  --w_mask_pixel 0.1 --w_mask_feature 0 \
+  --save_dir results/checkpoints/maskfix_B_pixel_s42
 
 # C: masked-feature prediction only
 python train_masked.py $COMMON \
   --w_mask_pixel 0 --w_mask_feature 0.05 \
-  --save_dir results/checkpoints/mask_C_feature_s42
+  --save_dir results/checkpoints/maskfix_C_feature_s42
 
 # D: full masked pixel + feature objective
 python train_masked.py $COMMON \
-  --w_mask_pixel 1 --w_mask_feature 0.05 \
-  --save_dir results/checkpoints/mask_D_full_s42
+  --w_mask_pixel 0.1 --w_mask_feature 0.05 \
+  --save_dir results/checkpoints/maskfix_D_full_s42
 ```
 
 Each directory contains `run_config.json`, `history.jsonl`, and one checkpoint
@@ -78,14 +94,14 @@ only its `model` entry.
 
 ```bash
 python eval_curve.py \
-  --checkpoint results/checkpoints/mask_D_full_s42/model_epoch_3.pth \
+  --checkpoint results/checkpoints/maskfix_D_full_s42/model_epoch_3.pth \
   --masked_model 1 \
-  --baseline_checkpoint results/checkpoints/mask_A_base_s42/model_epoch_3.pth \
+  --baseline_checkpoint results/checkpoints/maskfix_A_base_s42/model_epoch_3.pth \
   --baseline_masked_model 1 \
   --scene_dir /mnt2/songyd/5x5/5x5x4/0/npy \
   --n_frames 50 \
   --reference /home/songyd/Projects/Robust-N2N/reference.npy \
-  --out_dir results/eval_curve/mask_D_vs_A_s42
+  --out_dir results/eval_curve/maskfix_D_vs_A_s42
 ```
 
 Repeat with B and C as `--checkpoint` to isolate each objective.
@@ -95,12 +111,13 @@ Repeat with B and C as `--checkpoint` to isolate each objective.
 ```bash
 python eval_ood_robust.py \
   --data_path /mnt2/songyd/5x5 \
-  --eval_level 1 --gt_level 4 --max_frames_per_scene 3 \
-  --n2n_checkpoint results/checkpoints/mask_A_base_s42/model_epoch_3.pth \
+  --eval_level 1 --gt_level 4 --gt_frames 50 --max_frames_per_scene 3 \
+  --max_vis_scenes 6 \
+  --n2n_checkpoint results/checkpoints/maskfix_A_base_s42/model_epoch_3.pth \
   --n2n_masked_model 1 \
-  --robust_checkpoint results/checkpoints/mask_D_full_s42/model_epoch_3.pth \
+  --robust_checkpoint results/checkpoints/maskfix_D_full_s42/model_epoch_3.pth \
   --masked_model 1 \
-  --out_dir results/eval_ood/mask_D_s42
+  --out_dir results/eval_ood/maskfix_D_s42
 ```
 
 This is the strict architecture-controlled OOD comparison: both checkpoints
@@ -118,16 +135,17 @@ for SEED in 42 187 2413; do
   for ARM in A B C D; do
     case $ARM in
       A) PIX=0; FEAT=0 ;;
-      B) PIX=1; FEAT=0 ;;
+      B) PIX=0.1; FEAT=0 ;;
       C) PIX=0; FEAT=0.05 ;;
-      D) PIX=1; FEAT=0.05 ;;
+      D) PIX=0.1; FEAT=0.05 ;;
     esac
     python train_masked.py \
       --data_path /mnt2/songyd/5x5 --levels 4 \
       --epochs 3 --crop_size 512 --batch_size 16 --lr 0.01 \
       --rtv_weight 0.01 --mask_ratio 0.25 --mask_patch 16 \
+      --freeze_masked_bn_stats 1 --deterministic_loader_rng 1 \
       --w_mask_pixel $PIX --w_mask_feature $FEAT --seed $SEED \
-      --save_dir results/checkpoints/mask_${ARM}_s${SEED}
+      --save_dir results/checkpoints/maskfix_${ARM}_s${SEED}
   done
 done
 ```

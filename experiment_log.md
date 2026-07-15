@@ -128,3 +128,26 @@
   （单 1×1 卷积、无 predictor）。→ 尺度无关(∈[−1,1])，w_feat=0.1 生效；stop-grad 防塌。
 - 公平评测：改用 eval_ood_robust.py 在 5x5 level1 OOD 上比 N2N(lv234)，不再用 raw.npy 单图。
 - 结果：待 v7 训练回填。
+
+## 2026-07-15 Masked N2N 首轮失败与实验控制修正
+
+- 首轮配置（分支 `codex/masked-feature-prediction`，commit `337118a`）：level4 训练，3 epoch，
+  crop512/batch16，seed42，mask ratio=0.25、patch=16；A=(pixel0, feature0)，
+  B=(pixel1, feature0)，C=(pixel0, feature0.05)，D=(pixel1, feature0.05)。
+- ID 单场景 50 帧（PSNR/MSSIM）：A=32.519/0.863，B=31.972/0.859，
+  C=31.559/0.840，D=32.340/0.865。D 相对 A 为 −0.179 dB；只有 MSSIM +0.002。
+- OOD level1、39 场景、level4 前50帧均值伪GT（PSNR/SSIM）：A=22.465/0.6224，
+  B=21.272/0.6048，C=21.165/0.5063，D=22.153/0.6068。相对 A：
+  B=−1.193 dB/−0.0177，C=−1.301 dB/−0.1161，D=−0.312 dB/−0.0157。
+- 训练日志：epoch3 时 mask pixel raw loss≈0.270、主 N2N≈0.256，`w=1` 使辅助像素项与主任务等量；
+  C 的 feature 实际贡献仅 `0.009346×0.05≈0.000467`，却出现明显验证/OOD退化，不能用
+  “feature 权重过大”解释。
+- 定位到两个实验控制缺陷：① masked forward 同样更新 student 的 BatchNorm running statistics，
+  污染 all-visible 推理分布；② DataLoader shuffle/worker crop 和 mask 共用全局 RNG，predictor 初始化及
+  mask 随机数会改变不同 arm 的数据轨迹，seed42 并未形成严格配对。
+- 本次修正（本条记录所在提交）：masked forward 使用 batch statistics 和 BN affine 梯度，但暂停写入
+  running statistics；DataLoader/worker、mask 与 predictor 初始化使用相互隔离的 seeded RNG；日志新增
+  weighted RTV/pixel/feature；mask pixel pilot 权重降为0.1。旧 checkpoint 不与新结果混用，四个 arm 全部输出到
+  `results/checkpoints/maskfix_*`。
+- 修正后结果：待服务器重新训练并回填指标；必须同时检查
+  `results/eval_ood/maskfix_D_s42/compare/` 的全图与细血管局部放大，不能只凭 PSNR/SSIM 下结论。

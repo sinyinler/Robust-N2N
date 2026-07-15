@@ -20,7 +20,7 @@ from losses.masked_prediction import (
     make_block_visible_mask,
     masked_charbonnier,
 )
-from train_masked import update_ema
+from train_masked import suspend_batchnorm_running_stats, update_ema
 
 
 def main(device_name: str) -> None:
@@ -28,7 +28,11 @@ def main(device_name: str) -> None:
     torch.manual_seed(7)
     n1 = torch.rand(2, 1, 64, 64, device=device)
     n2 = torch.rand(2, 1, 64, 64, device=device)
-    visible = make_block_visible_mask(2, 64, 64, 0.25, 16, device=device, dtype=n1.dtype)
+    mask_generator = torch.Generator(device=device).manual_seed(20_043)
+    visible = make_block_visible_mask(
+        2, 64, 64, 0.25, 16,
+        device=device, dtype=n1.dtype, generator=mask_generator,
+    )
     hidden_ratio = float((1.0 - visible).mean())
     assert visible.shape == (2, 1, 64, 64)
     assert abs(hidden_ratio - 0.25) < 1e-6, hidden_ratio
@@ -36,8 +40,43 @@ def main(device_name: str) -> None:
     student = MaskedDenoiserWithFeats().to(device).train()
     teacher = copy.deepcopy(student).to(device).eval().requires_grad_(False)
     masked = apply_visible_mask(n1, visible, fill="zero")
+
+    # 独立 mask generator 必须不受全局 torch RNG 消耗影响。
+    generator_a = torch.Generator(device=device).manual_seed(1234)
+    generator_b = torch.Generator(device=device).manual_seed(1234)
+    mask_a = make_block_visible_mask(
+        2, 64, 64, 0.25, 16,
+        device=device, dtype=n1.dtype, generator=generator_a,
+    )
+    _ = torch.rand(128, device=device)
+    mask_b = make_block_visible_mask(
+        2, 64, 64, 0.25, 16,
+        device=device, dtype=n1.dtype, generator=generator_b,
+    )
+    assert torch.equal(mask_a, mask_b)
+
+    batchnorms = [
+        module for module in student.modules()
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm)
+    ]
+    tracked_before = [module.num_batches_tracked.detach().clone() for module in batchnorms]
+    means_before = [module.running_mean.detach().clone() for module in batchnorms]
+    with suspend_batchnorm_running_stats(student):
+        y_masked, student_feats = student(masked, visible, return_feats=True)
+    assert all(
+        torch.equal(module.num_batches_tracked, before)
+        for module, before in zip(batchnorms, tracked_before)
+    )
+    assert all(
+        torch.equal(module.running_mean, before)
+        for module, before in zip(batchnorms, means_before)
+    )
+
     y_normal = student(n1)
-    y_masked, student_feats = student(masked, visible, return_feats=True)
+    assert all(
+        torch.equal(module.num_batches_tracked, before + 1)
+        for module, before in zip(batchnorms, tracked_before)
+    )
     with torch.no_grad():
         _, teacher_feats = teacher(n2, return_feats=True)
 

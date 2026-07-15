@@ -16,6 +16,7 @@ import argparse
 import copy
 import json
 import random
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -44,6 +45,23 @@ def set_seed(seed: int) -> None:
 
 def unwrap(module: nn.Module) -> nn.Module:
     return module.module if isinstance(module, nn.DataParallel) else module
+
+
+@contextmanager
+def suspend_batchnorm_running_stats(module: nn.Module):
+    """Masked forward 使用 batch statistics，但不写入推理期 running statistics。"""
+    batchnorms = [
+        child for child in unwrap(module).modules()
+        if isinstance(child, nn.modules.batchnorm._BatchNorm)
+    ]
+    previous = [child.track_running_stats for child in batchnorms]
+    try:
+        for child in batchnorms:
+            child.track_running_stats = False
+        yield
+    finally:
+        for child, track_running_stats in zip(batchnorms, previous):
+            child.track_running_stats = track_running_stats
 
 
 @torch.no_grad()
@@ -107,7 +125,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mask_ratio", type=float, default=0.25)
     p.add_argument("--mask_patch", type=int, default=16)
     p.add_argument("--mask_fill", choices=["zero", "mean"], default="zero")
-    p.add_argument("--w_mask_pixel", type=float, default=1.0)
+    p.add_argument("--w_mask_pixel", type=float, default=0.1)
     p.add_argument("--w_mask_feature", type=float, default=0.05)
     p.add_argument("--mask_feature_scales", nargs="*", default=["encoder2", "encoder3"],
                    choices=["encoder1", "encoder2", "encoder3", "bottleneck"])
@@ -115,6 +133,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--predictor_hidden_ratio", type=float, default=1.0)
     p.add_argument("--ema_decay", type=float, default=0.996)
     p.add_argument("--feature_warmup_frac", type=float, default=0.1)
+    p.add_argument("--freeze_masked_bn_stats", type=int, default=1,
+                   help="masked forward 不更新 student BatchNorm running statistics")
+    p.add_argument("--deterministic_loader_rng", type=int, default=1,
+                   help="DataLoader 使用独立 generator，避免模型随机数改变样本顺序/worker crop")
+    p.add_argument("--mask_seed_offset", type=int, default=20_001,
+                   help="mask generator seed = seed + offset")
+    p.add_argument("--predictor_seed_offset", type=int, default=30_001,
+                   help="feature predictor seed = seed + offset，且不推进全局 Torch RNG")
 
     args = p.parse_args()
     args.data_index_min = None if args.data_index_min < 0 else args.data_index_min
@@ -130,6 +156,8 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("ema_decay must be in [0,1)")
     if args.feature_warmup_frac < 0:
         raise ValueError("feature_warmup_frac must be non-negative")
+    if args.mask_seed_offset < 0 or args.predictor_seed_offset < 0:
+        raise ValueError("mask/predictor seed offsets must be non-negative")
     if args.w_mask_feature > 0 and not args.mask_feature_scales:
         raise ValueError("feature scales cannot be empty when masked feature loss is enabled")
     if args.lambda_conditioned:
@@ -185,11 +213,15 @@ def train(args: argparse.Namespace) -> None:
     feat_channels = [scale_info[name][1] for name in args.mask_feature_scales]
     feature_loss = None
     if args.w_mask_feature > 0:
-        feature_loss = MaskedFeaturePredictionLoss(
-            feat_channels,
-            weights=args.mask_feature_weights,
-            predictor_hidden_ratio=args.predictor_hidden_ratio,
-        ).to(device)
+        # predictor 初始化使用独立 seed，并在退出后恢复全局 CPU RNG 状态；
+        # 因此 C/D 不会仅因多建了 predictor 就改变后续数据随机轨迹。
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(args.seed + args.predictor_seed_offset)
+            feature_loss = MaskedFeaturePredictionLoss(
+                feat_channels,
+                weights=args.mask_feature_weights,
+                predictor_hidden_ratio=args.predictor_hidden_ratio,
+            ).to(device)
 
     if args.data_parallel and torch.cuda.device_count() > 1:
         student = nn.DataParallel(student)
@@ -205,6 +237,8 @@ def train(args: argparse.Namespace) -> None:
     total_steps = max(1, args.epochs * len(train_loader))
     feature_warmup_steps = int(max(0.0, args.feature_warmup_frac) * total_steps)
     use_mask = args.w_mask_pixel > 0 or args.w_mask_feature > 0
+    mask_generator = torch.Generator(device=device)
+    mask_generator.manual_seed(args.seed + args.mask_seed_offset)
     print(
         f"[INFO] device={device} batches={len(train_loader)} mask={use_mask} "
         f"ratio={args.mask_ratio} patch={args.mask_patch} fill={args.mask_fill}"
@@ -213,6 +247,12 @@ def train(args: argparse.Namespace) -> None:
         f"[INFO] loss = N2N + {args.w_mask_pixel}*mask_pixel + "
         f"{args.w_mask_feature}*mask_feature + {args.rtv_weight}*RTV; "
         f"feature_scales={args.mask_feature_scales} ema={args.ema_decay}"
+    )
+    print(
+        f"[INFO] controls: freeze_masked_bn_stats={bool(args.freeze_masked_bn_stats)} "
+        f"deterministic_loader_rng={bool(args.deterministic_loader_rng)} "
+        f"mask_seed={args.seed + args.mask_seed_offset} "
+        f"predictor_seed={args.seed + args.predictor_seed_offset}"
     )
 
     history_path = save_dir / "history.jsonl"
@@ -228,16 +268,24 @@ def train(args: argparse.Namespace) -> None:
             n2 = n2.to(device, non_blocking=True)
             loss_mask_pixel = n1.new_zeros(())
             loss_mask_feature = n1.new_zeros(())
+            ramp = 0.0
             per_scale: list[float] = []
             actual_hidden = 0.0
             if use_mask:
                 visible = make_block_visible_mask(
                     n1.shape[0], n1.shape[2], n1.shape[3], args.mask_ratio, args.mask_patch,
-                    device=n1.device, dtype=n1.dtype,
+                    device=n1.device, dtype=n1.dtype, generator=mask_generator,
                 )
                 actual_hidden = float((1.0 - visible).mean())
                 masked_n1 = apply_visible_mask(n1, visible, fill=args.mask_fill)
-                y_masked, masked_feats = student(masked_n1, visible, return_feats=True)
+                # Masked 分支仍使用当前 batch statistics 和 BN affine 参数梯度，
+                # 但不允许它污染 all-visible 推理所依赖的 running statistics。
+                bn_context = (
+                    suspend_batchnorm_running_stats(student)
+                    if args.freeze_masked_bn_stats else nullcontext()
+                )
+                with bn_context:
+                    y_masked, masked_feats = student(masked_n1, visible, return_feats=True)
                 if args.w_mask_pixel > 0:
                     loss_mask_pixel = masked_charbonnier(
                         y_masked, n2, visible, eps=args.charb_eps
@@ -254,15 +302,14 @@ def train(args: argparse.Namespace) -> None:
                         1.0, float(global_step + 1) / feature_warmup_steps
                     )
 
-            # Run the all-visible branch last so BatchNorm running statistics
-            # end each step closer to the inference distribution.
+            # 只有 all-visible 分支更新持久化 BN statistics。
             y_normal = student(n1)  # all-visible mask is injected by the wrapper
             loss_n2n = charb(y_normal, n2)
             loss_rtv = rtv(y_normal) if args.rtv_weight > 0 else y_normal.new_zeros(())
-            total = loss_n2n + args.rtv_weight * loss_rtv
-            total = total + args.w_mask_pixel * loss_mask_pixel
-            if feature_loss is not None:
-                total = total + args.w_mask_feature * ramp * loss_mask_feature
+            weighted_rtv = args.rtv_weight * loss_rtv
+            weighted_mask_pixel = args.w_mask_pixel * loss_mask_pixel
+            weighted_mask_feature = args.w_mask_feature * ramp * loss_mask_feature
+            total = loss_n2n + weighted_rtv + weighted_mask_pixel + weighted_mask_feature
 
             optimizer.zero_grad(set_to_none=True)
             total.backward()
@@ -281,6 +328,9 @@ def train(args: argparse.Namespace) -> None:
                 "rtv": float(loss_rtv.detach()),
                 "mask_pixel": float(loss_mask_pixel.detach()),
                 "mask_feature": float(loss_mask_feature.detach()),
+                "weighted_rtv": float(weighted_rtv.detach()),
+                "weighted_mask_pixel": float(weighted_mask_pixel.detach()),
+                "weighted_mask_feature": float(weighted_mask_feature.detach()),
                 "hidden": actual_hidden,
             }
             for i, value in enumerate(per_scale):
@@ -289,8 +339,8 @@ def train(args: argparse.Namespace) -> None:
                 running[key] = running.get(key, 0.0) + value
             pbar.set_postfix({
                 "loss": f"{logs['total']:.4f}",
-                "pix": f"{logs['mask_pixel']:.4f}",
-                "feat": f"{logs['mask_feature']:.4f}",
+                "wpix": f"{logs['weighted_mask_pixel']:.4f}",
+                "wfeat": f"{logs['weighted_mask_feature']:.4f}",
                 "lr": f"{scheduler.get_last_lr()[0]:.2g}",
             })
 
