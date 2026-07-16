@@ -203,3 +203,20 @@
   `train_masked.py` 将既有 `1e-4` 暴露为参数但默认行为不变；`eval_masked_epochs.py` 新增可选
   `--original_dir_template`，同帧输出 Original/A/C 指标、C-A、C-Original、A-Original、bootstrap CI
   及五列同窗宽局部放大图。结果待服务器训练后回填。
+
+## 2026-07-16 Masked feature 微调阶段 2：100 epoch 收敛曲线与 feature weight=0.10
+
+- 多 seed 5-epoch 结果表明：`w_mask_feature=0.05` 在 epoch4 相对 A-base 的 level1 OOD PSNR
+  三个 seed 均提升且逐场景 bootstrap CI 均大于零；到 epoch5 后独立增益减弱。下一项保持数据、网络、
+  optimizer 和其他 loss 不变，只把 feature weight 从 0.05 调到 0.10，并与原始单通道 N2N 同时从头
+  训练 100 epoch，观察辅助约束能否在训练后期维持作用。
+- 新增 `utils/training_curves.py`。两个训练入口默认每个 epoch 从 `history.jsonl` 自动刷新
+  `loss_curve.png` 和 `loss_history.csv`。原始 N2N 画可直接比较的 train/validation loss；masked
+  模型同时画 train total、validation reconstruction、可比的 train reconstruction（N2N+RTV）以及
+  weighted feature/RTV 等分量，避免把含辅助项的 train total 与不含辅助项的 validation 误当成同一目标。
+- 两个100-epoch进程分别固定到两张24GB GPU，并显式关闭 DataParallel；batch size 均为16。100-epoch
+  OneCycleLR 会重定义完整学习率轨迹，因此两组都必须从头训练，不能续接5-epoch checkpoint。
+- 新增 `scripts/run_e100_original_feature010.sh`，默认 seed42，分别绑定物理 GPU0/GPU1 并行启动；
+  独立保存 stdout 日志、PID、checkpoint 和 loss 曲线。脚本拒绝复用已有输出目录，避免重复运行时把
+  不同训练轨迹追加进同一 `history.jsonl`。这两组只能衡量 C-system 相对 Original 的净变化；若要严格
+  隔离 `0.10-0.05` 或 feature 本身，仍需同调度的 `w=0.05` 或 A-base 对照。

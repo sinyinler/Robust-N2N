@@ -34,6 +34,7 @@ from losses.masked_prediction import (
     make_block_visible_mask,
     masked_charbonnier,
 )
+from utils.training_curves import update_training_curves
 
 
 def set_seed(seed: int) -> None:
@@ -208,6 +209,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad_diag_scales", nargs="*", default=["encoder2", "encoder3"],
                    choices=["encoder1", "encoder2", "encoder3", "bottleneck"],
                    help="梯度诊断作用层；不改变实际 loss 或反向传播")
+    p.add_argument("--plot_loss_curve", type=int, default=1,
+                   help="1=每个 epoch 自动更新 loss_curve.png 和 loss_history.csv")
 
     args = p.parse_args()
     args.data_index_min = None if args.data_index_min < 0 else args.data_index_min
@@ -451,6 +454,12 @@ def train(args: argparse.Namespace) -> None:
         record = {"epoch": epoch, "val": val, **avg}
         with history_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        if args.plot_loss_curve:
+            try:
+                update_training_curves(history_path, "Masked N2N with feature prediction")
+            except Exception as error:
+                # 绘图是只读诊断，不能因为可视化异常中断长时间训练。
+                print(f"[WARN] loss 曲线更新失败，训练继续：{error}")
 
         payload = {
             "model": unwrap(student).state_dict(),

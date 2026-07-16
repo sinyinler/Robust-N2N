@@ -33,6 +33,7 @@ from losses.charbonnier import CharbonnierLoss
 from losses.rtv import RTVRegularizer
 from models.denoiser import Denoiser
 from utils.checkpoint import load_weights_flexible
+from utils.training_curves import update_training_curves
 
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -377,6 +378,12 @@ def train(args) -> None:
                 "train": avg_train,
                 "val": avg_val,
             }, ensure_ascii=False) + "\n")
+        if args.plot_loss_curve:
+            try:
+                update_training_curves(history_path, "Original single-channel N2N")
+            except Exception as error:
+                # 绘图是只读诊断，不能因为可视化异常中断长时间训练。
+                print(f"[WARN] loss 曲线更新失败，训练继续：{error}")
         print(f"[EPOCH {epoch}] train_loss={avg_train:.6f} val_loss={avg_val:.6f} saved={save_path}")
 
     writer.close()
@@ -434,6 +441,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data_parallel", type=int, default=1)
     parser.add_argument("--deterministic_loader_rng", type=int, default=0,
                         help="1=DataLoader 使用 seed+10001/10002 的独立 RNG，便于与 masked arms 配对。")
+    parser.add_argument("--plot_loss_curve", type=int, default=1,
+                        help="1=每个 epoch 自动更新 loss_curve.png 和 loss_history.csv")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="")
     args = parser.parse_args()
