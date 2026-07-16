@@ -224,3 +224,6 @@
   激活规模，因此先检查 GPU1 占用，并将 feature 默认 batch 降为12；原始 N2N 保持16。启动脚本新增
   `N2N_BATCH`/`FEATURE_BATCH` 环境变量，checkpoint 和日志目录显式包含 batch，避免混淆失败的 batch16
   轨迹与重新从头训练的 batch12 轨迹。
+- 公平性修正：Original 和 feature 两组必须使用相同 batch。最终协议将两组默认值都设为12，并废弃已启动
+  的 Original batch16 轨迹；两组从 epoch1 重新训练。原因不仅是单批梯度统计不同，batch 还会改变每个
+  epoch 的 optimizer step 数和100-epoch OneCycleLR 的完整轨迹，不能从 batch16 checkpoint 续训。

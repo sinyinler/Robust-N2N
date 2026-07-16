@@ -6,7 +6,7 @@ DATA="${DATA:-/mnt2/songyd/5x5}"
 SEED="${SEED:-42}"
 GPU_N2N="${GPU_N2N:-0}"
 GPU_FEATURE="${GPU_FEATURE:-1}"
-N2N_BATCH="${N2N_BATCH:-16}"
+N2N_BATCH="${N2N_BATCH:-12}"
 FEATURE_BATCH="${FEATURE_BATCH:-12}"
 
 N2N_DIR="results/checkpoints/n2n_original_E100_b${N2N_BATCH}_s${SEED}"
