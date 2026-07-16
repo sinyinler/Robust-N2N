@@ -220,3 +220,7 @@
   独立保存 stdout 日志、PID、checkpoint 和 loss 曲线。脚本拒绝复用已有输出目录，避免重复运行时把
   不同训练轨迹追加进同一 `history.jsonl`。这两组只能衡量 C-system 相对 Original 的净变化；若要严格
   隔离 `0.10-0.05` 或 feature 本身，仍需同调度的 `w=0.05` 或 A-base 对照。
+- 首次双 GPU 启动时 feature 组 batch16 在 GPU1 OOM。100 epoch 与 feature loss 的标量权重不改变单步
+  激活规模，因此先检查 GPU1 占用，并将 feature 默认 batch 降为12；原始 N2N 保持16。启动脚本新增
+  `N2N_BATCH`/`FEATURE_BATCH` 环境变量，checkpoint 和日志目录显式包含 batch，避免混淆失败的 batch16
+  轨迹与重新从头训练的 batch12 轨迹。

@@ -6,10 +6,12 @@ DATA="${DATA:-/mnt2/songyd/5x5}"
 SEED="${SEED:-42}"
 GPU_N2N="${GPU_N2N:-0}"
 GPU_FEATURE="${GPU_FEATURE:-1}"
+N2N_BATCH="${N2N_BATCH:-16}"
+FEATURE_BATCH="${FEATURE_BATCH:-12}"
 
-N2N_DIR="results/checkpoints/n2n_original_E100_s${SEED}"
-FEATURE_DIR="results/checkpoints/masktune_E100_C_feature_w010_s${SEED}"
-RUN_LOG_DIR="results/logs/E100_original_feature010_s${SEED}"
+N2N_DIR="results/checkpoints/n2n_original_E100_b${N2N_BATCH}_s${SEED}"
+FEATURE_DIR="results/checkpoints/masktune_E100_C_feature_w010_b${FEATURE_BATCH}_s${SEED}"
+RUN_LOG_DIR="results/logs/E100_original_b${N2N_BATCH}_feature010_b${FEATURE_BATCH}_s${SEED}"
 
 if [[ -e "$N2N_DIR" || -e "$FEATURE_DIR" ]]; then
   echo "[ERROR] 输出目录已存在；为避免覆盖或重复追加 history，请先改目录名或确认旧结果。"
@@ -21,8 +23,8 @@ fi
 mkdir -p "$RUN_LOG_DIR"
 
 echo "[INFO] data=$DATA seed=$SEED"
-echo "[INFO] original N2N -> physical GPU $GPU_N2N"
-echo "[INFO] feature w=0.10 -> physical GPU $GPU_FEATURE"
+echo "[INFO] original N2N -> physical GPU $GPU_N2N, batch=$N2N_BATCH"
+echo "[INFO] feature w=0.10 -> physical GPU $GPU_FEATURE, batch=$FEATURE_BATCH"
 echo "[INFO] git=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
 CUDA_VISIBLE_DEVICES="$GPU_N2N" python -u train_n2n.py \
@@ -31,7 +33,7 @@ CUDA_VISIBLE_DEVICES="$GPU_N2N" python -u train_n2n.py \
   --intervals 5 7 9 \
   --epochs 100 \
   --crop_size 512 \
-  --batch_size 16 \
+  --batch_size "$N2N_BATCH" \
   --lr 0.01 \
   --lr_final 0.0005 \
   --warmup_pct 0.1 \
@@ -55,7 +57,7 @@ CUDA_VISIBLE_DEVICES="$GPU_FEATURE" python -u train_masked.py \
   --intervals 5 7 9 \
   --epochs 100 \
   --crop_size 512 \
-  --batch_size 16 \
+  --batch_size "$FEATURE_BATCH" \
   --lr 0.01 \
   --lr_final 0.0005 \
   --warmup_pct 0.1 \
