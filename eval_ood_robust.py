@@ -28,6 +28,7 @@ if str(ROOT) not in sys.path:
 from data.discovery import discover_sequence_dirs, list_supported_files, load_2d
 from models.denoiser import Denoiser
 from models.denoiser_feats import DenoiserWithFeats
+from models.masked_denoiser import MaskedDenoiserWithFeats
 from utils.checkpoint import load_weights_flexible
 from utils.metrics import center_crop_to_match, psnr, ssim_simple
 
@@ -122,10 +123,14 @@ def save_panels(named_images, out_path, zoom_size):
 def main(args):
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
 
-    n2n = Denoiser(input_channels=1).to(device).eval()
-    print("[INFO] N2N:", load_weights_flexible(n2n, args.n2n_checkpoint, device))
-    robust = DenoiserWithFeats(input_channels=1).to(device).eval()
-    print("[INFO] Robust-N2N:", load_weights_flexible(robust, args.robust_checkpoint, device))
+    n2n = (MaskedDenoiserWithFeats(image_channels=1) if args.n2n_masked_model
+           else Denoiser(input_channels=1)).to(device).eval()
+    n2n_name = "Masked Arm-A baseline" if args.n2n_masked_model else "N2N (lv234)"
+    print(f"[INFO] {n2n_name}:", load_weights_flexible(n2n, args.n2n_checkpoint, device))
+    robust = (MaskedDenoiserWithFeats(image_channels=1) if args.masked_model
+              else DenoiserWithFeats(input_channels=1)).to(device).eval()
+    robust_name = "Masked-N2N" if args.masked_model else "Robust-N2N"
+    print(f"[INFO] {robust_name}:", load_weights_flexible(robust, args.robust_checkpoint, device))
 
     scene_map = build_scene_index(args.data_path, args.data_subdirs, bool(args.strict_data_subdir))
     all_levels = sorted({lv for d in scene_map.values() for lv in d})
@@ -166,7 +171,7 @@ def main(args):
             if vis_done < args.max_vis_scenes and fi == 0:
                 save_panels(
                     [("noisy(level%d)" % args.eval_level, noisy_z), ("N2N", n2n_z),
-                     ("Robust-N2N", rob_z), ("pseudo-GT(level%d)" % gt_level, gt_z)],
+                     (robust_name, rob_z), ("pseudo-GT(level%d)" % gt_level, gt_z)],
                     compare_dir / f"scene{scene}_frame0.png", args.zoom_size,
                 )
 
@@ -184,7 +189,7 @@ def main(args):
     print(f"\n==== OOD eval on level{args.eval_level} (vs pseudo-GT level{gt_level}, {len(per_scene)} scenes, log1p域) ====")
     print(f"{'method':>14} | {'PSNR(dB)':>9} | {'SSIM':>7}")
     print("-" * 36)
-    label = {"noisy": "noisy input", "n2n": "N2N (lv234)", "robust": "Robust-N2N"}
+    label = {"noisy": "noisy input", "n2n": n2n_name, "robust": robust_name}
     for k in ("noisy", "n2n", "robust"):
         print(f"{label[k]:>14} | {summary[k][0]:>9.3f} | {summary[k][1]:>7.4f}")
     gain_psnr = summary["robust"][0] - summary["n2n"][0]
@@ -219,7 +224,11 @@ def parse_args():
     p.add_argument("--max_vis_scenes", type=int, default=12)
     p.add_argument("--zoom_size", type=int, default=128)
     p.add_argument("--n2n_checkpoint", type=str, required=True)
+    p.add_argument("--n2n_masked_model", type=int, default=0,
+                   help="1=基线 checkpoint 是 train_masked.py 的 Arm-A 双通道模型")
     p.add_argument("--robust_checkpoint", type=str, required=True)
+    p.add_argument("--masked_model", type=int, default=0,
+                   help="1=robust checkpoint 来自 train_masked.py")
     p.add_argument("--out_dir", type=str, default="results/eval_ood_robust")
     p.add_argument("--device", type=str, default="")
     return p.parse_args()

@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import random
 import sys
 from collections import defaultdict
@@ -34,6 +33,7 @@ from losses.charbonnier import CharbonnierLoss
 from losses.rtv import RTVRegularizer
 from models.denoiser import Denoiser
 from utils.checkpoint import load_weights_flexible
+from utils.training_curves import update_training_curves
 
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -153,12 +153,25 @@ def build_multisource_loaders(args):
                                         generator=torch.Generator().manual_seed(args.seed))
     else:
         train_ds, val_ds = view, None
+    # Masked 消融可启用 DataLoader 独立 RNG，避免模型/predictor/mask 的随机数
+    # 悄悄改变样本顺序或 worker 随机裁剪。
+    deterministic_loader_rng = bool(getattr(args, "deterministic_loader_rng", 0))
+    train_generator = (
+        torch.Generator().manual_seed(args.seed + 10_001)
+        if deterministic_loader_rng else None
+    )
+    val_generator = (
+        torch.Generator().manual_seed(args.seed + 10_002)
+        if deterministic_loader_rng else None
+    )
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=True,
-                              prefetch_factor=2 if args.num_workers > 0 else None)
+                              prefetch_factor=2 if args.num_workers > 0 else None,
+                              generator=train_generator)
     val_loader = None if val_ds is None else DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.val_num_workers, pin_memory=True)
+        num_workers=args.val_num_workers, pin_memory=True,
+        generator=val_generator)
     print(f"[INFO] multi-source N2N: {total} samples (crop={crop}, 5x5 levels={args.levels}, "
           f"mix_root={args.mix_root}, mix_scenes={args.mix_scenes})")
     return base, train_loader, val_loader
@@ -200,6 +213,16 @@ def build_loaders(args):
     else:
         train_dataset, val_dataset = full_dataset, None
 
+    deterministic_loader_rng = bool(getattr(args, "deterministic_loader_rng", 0))
+    train_generator = (
+        torch.Generator().manual_seed(args.seed + 10_001)
+        if deterministic_loader_rng else None
+    )
+    val_generator = (
+        torch.Generator().manual_seed(args.seed + 10_002)
+        if deterministic_loader_rng else None
+    )
+
     if args.crop_size <= 0:
         max_pixels_per_batch = args.max_pixels_per_batch or args.batch_size * args.batch_ref_size * args.batch_ref_size
         train_loader = DataLoader(
@@ -208,12 +231,14 @@ def build_loaders(args):
             num_workers=args.num_workers,
             pin_memory=True,
             prefetch_factor=2 if args.num_workers > 0 else None,
+            generator=train_generator,
         )
         val_loader = None if val_dataset is None else DataLoader(
             val_dataset,
             batch_sampler=ShapeBatchSampler(val_dataset, args.batch_size, shuffle=False, seed=args.seed + 1, max_pixels_per_batch=max_pixels_per_batch),
             num_workers=args.val_num_workers,
             pin_memory=True,
+            generator=val_generator,
         )
     else:
         train_loader = DataLoader(
@@ -223,6 +248,7 @@ def build_loaders(args):
             num_workers=args.num_workers,
             pin_memory=True,
             prefetch_factor=2 if args.num_workers > 0 else None,
+            generator=train_generator,
         )
         val_loader = None if val_dataset is None else DataLoader(
             val_dataset,
@@ -230,6 +256,7 @@ def build_loaders(args):
             shuffle=False,
             num_workers=args.val_num_workers,
             pin_memory=True,
+            generator=val_generator,
         )
     return full_dataset, train_loader, val_loader
 
@@ -273,7 +300,7 @@ def train(args) -> None:
         lr=args.lr_final,
         betas=(0.9, 0.999),
         eps=1e-8,
-        weight_decay=0.01,
+        weight_decay=args.weight_decay,
     )
     scheduler = build_onecycle(optimizer, len(train_loader), args)
     writer = SummaryWriter(log_dir=str(log_dir))
@@ -283,8 +310,14 @@ def train(args) -> None:
     (save_dir / "run_config.json").write_text(json.dumps(run_config, indent=2, ensure_ascii=False), encoding="utf-8")
 
     print(f"[INFO] device={device}, input_channels={input_channels}, dataset={len(full_dataset)}")
-    print(f"[INFO] optimizer=AdamW, lr_final={args.lr_final}, lr_max={args.lr_max}, warmup_pct={args.warmup_pct}, scheduler=OneCycleLR(cos)")
+    print(
+        f"[INFO] optimizer=AdamW, weight_decay={args.weight_decay}, "
+        f"lr_final={args.lr_final}, lr_max={args.lr_max}, "
+        f"warmup_pct={args.warmup_pct}, scheduler=OneCycleLR(cos), "
+        f"deterministic_loader_rng={bool(args.deterministic_loader_rng)}"
+    )
 
+    history_path = save_dir / "history.jsonl"
     global_step = 0
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -339,6 +372,18 @@ def train(args) -> None:
         state_dict = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
         save_path = save_dir / f"model_epoch_{epoch}.pth"
         torch.save(state_dict, save_path)
+        with history_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "epoch": epoch,
+                "train": avg_train,
+                "val": avg_val,
+            }, ensure_ascii=False) + "\n")
+        if args.plot_loss_curve:
+            try:
+                update_training_curves(history_path, "Original single-channel N2N")
+            except Exception as error:
+                # 绘图是只读诊断，不能因为可视化异常中断长时间训练。
+                print(f"[WARN] loss 曲线更新失败，训练继续：{error}")
         print(f"[EPOCH {epoch}] train_loss={avg_train:.6f} val_loss={avg_val:.6f} saved={save_path}")
 
     writer.close()
@@ -390,8 +435,14 @@ def parse_args() -> argparse.Namespace:
         default=[-0.3, -0.25, -0.2, -0.15, -0.1, -0.075, -0.05, -0.025, 0.0, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2],
     )
     parser.add_argument("--rtv_weight", type=float, default=0.01)
+    parser.add_argument("--weight_decay", type=float, default=0.01,
+                        help="AdamW weight decay；0.01 保持原始 N2N 配方。")
     parser.add_argument("--grad_clip", type=float, default=0.0)
     parser.add_argument("--data_parallel", type=int, default=1)
+    parser.add_argument("--deterministic_loader_rng", type=int, default=0,
+                        help="1=DataLoader 使用 seed+10001/10002 的独立 RNG，便于与 masked arms 配对。")
+    parser.add_argument("--plot_loss_curve", type=int, default=1,
+                        help="1=每个 epoch 自动更新 loss_curve.png 和 loss_history.csv")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="")
     args = parser.parse_args()
@@ -404,6 +455,8 @@ def parse_args() -> argparse.Namespace:
         args.lr_max = args.lr
     if args.lr_max <= args.lr_final:
         raise ValueError(f"lr_max must be greater than lr_final, got lr_max={args.lr_max}, lr_final={args.lr_final}")
+    if args.weight_decay < 0:
+        raise ValueError("weight_decay must be non-negative")
     return args
 
 

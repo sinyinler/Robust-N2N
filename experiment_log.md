@@ -128,3 +128,119 @@
   （单 1×1 卷积、无 predictor）。→ 尺度无关(∈[−1,1])，w_feat=0.1 生效；stop-grad 防塌。
 - 公平评测：改用 eval_ood_robust.py 在 5x5 level1 OOD 上比 N2N(lv234)，不再用 raw.npy 单图。
 - 结果：待 v7 训练回填。
+
+## 2026-07-15 Masked N2N 首轮失败与实验控制修正
+
+- 首轮配置（分支 `codex/masked-feature-prediction`，commit `337118a`）：level4 训练，3 epoch，
+  crop512/batch16，seed42，mask ratio=0.25、patch=16；A=(pixel0, feature0)，
+  B=(pixel1, feature0)，C=(pixel0, feature0.05)，D=(pixel1, feature0.05)。
+- ID 单场景 50 帧（PSNR/MSSIM）：A=32.519/0.863，B=31.972/0.859，
+  C=31.559/0.840，D=32.340/0.865。D 相对 A 为 −0.179 dB；只有 MSSIM +0.002。
+- OOD level1、39 场景、level4 前50帧均值伪GT（PSNR/SSIM）：A=22.465/0.6224，
+  B=21.272/0.6048，C=21.165/0.5063，D=22.153/0.6068。相对 A：
+  B=−1.193 dB/−0.0177，C=−1.301 dB/−0.1161，D=−0.312 dB/−0.0157。
+- 训练日志：epoch3 时 mask pixel raw loss≈0.270、主 N2N≈0.256，`w=1` 使辅助像素项与主任务等量；
+  C 的 feature 实际贡献仅 `0.009346×0.05≈0.000467`，却出现明显验证/OOD退化，不能用
+  “feature 权重过大”解释。
+- 定位到两个实验控制缺陷：① masked forward 同样更新 student 的 BatchNorm running statistics，
+  污染 all-visible 推理分布；② DataLoader shuffle/worker crop 和 mask 共用全局 RNG，predictor 初始化及
+  mask 随机数会改变不同 arm 的数据轨迹，seed42 并未形成严格配对。
+- 本次修正（本条记录所在提交）：masked forward 使用 batch statistics 和 BN affine 梯度，但暂停写入
+  running statistics；DataLoader/worker、mask 与 predictor 初始化使用相互隔离的 seeded RNG；日志新增
+  weighted RTV/pixel/feature；mask pixel pilot 权重降为0.1。旧 checkpoint 不与新结果混用，四个 arm 全部输出到
+  `results/checkpoints/maskfix_*`。
+- 修正后结果：待服务器重新训练并回填指标；必须同时检查
+  `results/eval_ood/maskfix_D_s42/compare/` 的全图与细血管局部放大，不能只凭 PSNR/SSIM 下结论。
+
+## 2026-07-15 Masked feature 微调阶段 0：epoch 曲线与梯度诊断
+
+- 目的：在改变 feature weight、mask ratio 或 projector 前，先用现有 A/C checkpoint 判断 3 epoch 是否训练充分，
+  并测量 N2N 与 masked feature 两项目标在 Encoder2/3 上的真实梯度强度和方向，避免只按 loss 标量猜权重。
+- 本条所在提交新增 `eval_masked_epochs.py`：统一评估 A-base/C-feature 的 seed=42/187/2413、epoch=1/2/3，
+  固定使用同一 level4 场景前 50 帧和同一 reference；输出逐帧 CSV、seed/epoch 汇总、跨 seed epoch 曲线、
+  paired bootstrap 95% CI，以及同窗宽全图/中心局部放大。ID test 曲线只作学习过程诊断，checkpoint 选择仍以
+  `history.jsonl` 的 validation loss 为先，避免用 test PSNR 直接选 epoch。
+- `train_masked.py` 新增可选 `--grad_diag_every` 和 `--grad_diag_scales`。诊断通过 `torch.autograd.grad`
+  临时读取梯度，不写入参数 `.grad`，记录到每次训练目录的 `grad_diagnostics.jsonl`；默认关闭，后续微调命令
+  显式使用 `--grad_diag_every 100 --grad_diag_scales encoder2 encoder3`。新增
+  `scripts/summarize_grad_diagnostics.py`，默认排除 warmup（`ramp<0.99`），汇总 feature/N2N 梯度范数比、
+  梯度余弦、负余弦比例和强冲突（默认 cosine<-0.2）比例。
+- 第一阶段服务器评估命令：
+
+  ```bash
+  python eval_masked_epochs.py \
+    --checkpoint_root results/checkpoints \
+    --a_dir_template 'maskfix_A_base_s{seed}' \
+    --c_dir_template 'maskfix_C_feature_s{seed}' \
+    --seeds 42 187 2413 \
+    --epochs 1 2 3 \
+    --scene_dir /mnt2/songyd/5x5/5x5x4/0/npy \
+    --reference /home/songyd/Projects/Robust-N2N/reference.npy \
+    --n_frames 50 \
+    --max_vis_frames 1 \
+    --device cuda \
+    --out_dir results/eval_id/maskfix_epoch_sweep
+  ```
+
+- 结果：待服务器执行后回填 `results/eval_id/maskfix_epoch_sweep/summary.json`、`epoch_summary.csv` 和
+  `compare/` 的视觉结论；确认 epoch 3 是否仍改善后，才进入第一个单变量微调。
+
+## 2026-07-15 Masked feature 微调阶段 1：seed42、5 epoch、加入原始 N2N
+
+- 阶段 0 结果：A/C 三 seed 在 epoch3 的 ID 配对增益为 `+0.226±0.023 dB`，三个 seed 分别
+  `+0.214/+0.252/+0.212 dB`，总胜出 `127/150` 帧；跨 seed MSSIM `+0.00130`、Pearson r
+  `+0.00251`。A/C 六条 validation 曲线从 epoch2 到 epoch3 全部继续下降，因此先验证 5 epoch，
+  暂不调 feature weight，也不加 projector。
+- 本轮只跑 seed42，但同时从头训练三组：
+  1. Original：`train_n2n.py` 单通道网络、原始 N2N loss/optimizer 配方，`weight_decay=0.01`；
+  2. A-base：双通道 all-visible 公平基线，`weight_decay=1e-4`；
+  3. C-feature：A-base + masked feature prediction，`weight_decay=1e-4`。
+- 解释边界：`C-A` 隔离 feature-loss；`C-Original` 回答相对原始系统的实际净提升；`A-Original`
+  量化双通道/trainer/weight-decay 等非 feature 因素，三者不可互相替代。三组都固定 level4、crop512、
+  batch16、seed42、同一独立 DataLoader RNG 和 5 epoch OneCycle；5-epoch OneCycle 会重定义整个学习率轨迹，
+  因此必须从头训练，不能把旧 3-epoch checkpoint 直接续两轮。
+- 实现：`train_n2n.py` 新增显式 `--weight_decay`、`--deterministic_loader_rng` 和 `history.jsonl`；
+  `train_masked.py` 将既有 `1e-4` 暴露为参数但默认行为不变；`eval_masked_epochs.py` 新增可选
+  `--original_dir_template`，同帧输出 Original/A/C 指标、C-A、C-Original、A-Original、bootstrap CI
+  及五列同窗宽局部放大图。结果待服务器训练后回填。
+
+## 2026-07-16 Masked feature 微调阶段 2：100 epoch 收敛曲线与 feature weight=0.10
+
+- 多 seed 5-epoch 结果表明：`w_mask_feature=0.05` 在 epoch4 相对 A-base 的 level1 OOD PSNR
+  三个 seed 均提升且逐场景 bootstrap CI 均大于零；到 epoch5 后独立增益减弱。下一项保持数据、网络、
+  optimizer 和其他 loss 不变，只把 feature weight 从 0.05 调到 0.10，并与原始单通道 N2N 同时从头
+  训练 100 epoch，观察辅助约束能否在训练后期维持作用。
+- 新增 `utils/training_curves.py`。两个训练入口默认每个 epoch 从 `history.jsonl` 自动刷新
+  `loss_curve.png` 和 `loss_history.csv`。原始 N2N 画可直接比较的 train/validation loss；masked
+  模型同时画 train total、validation reconstruction、可比的 train reconstruction（N2N+RTV）以及
+  weighted feature/RTV 等分量，避免把含辅助项的 train total 与不含辅助项的 validation 误当成同一目标。
+- 两个100-epoch进程分别固定到两张24GB GPU，并显式关闭 DataParallel；batch size 均为16。100-epoch
+  OneCycleLR 会重定义完整学习率轨迹，因此两组都必须从头训练，不能续接5-epoch checkpoint。
+- 新增 `scripts/run_e100_original_feature010.sh`，默认 seed42，分别绑定物理 GPU0/GPU1 并行启动；
+  独立保存 stdout 日志、PID、checkpoint 和 loss 曲线。脚本拒绝复用已有输出目录，避免重复运行时把
+  不同训练轨迹追加进同一 `history.jsonl`。这两组只能衡量 C-system 相对 Original 的净变化；若要严格
+  隔离 `0.10-0.05` 或 feature 本身，仍需同调度的 `w=0.05` 或 A-base 对照。
+- 首次双 GPU 启动时 feature 组 batch16 在 GPU1 OOM。100 epoch 与 feature loss 的标量权重不改变单步
+  激活规模，因此先检查 GPU1 占用，并将 feature 默认 batch 降为12；原始 N2N 保持16。启动脚本新增
+  `N2N_BATCH`/`FEATURE_BATCH` 环境变量，checkpoint 和日志目录显式包含 batch，避免混淆失败的 batch16
+  轨迹与重新从头训练的 batch12 轨迹。
+- 公平性修正：Original 和 feature 两组必须使用相同 batch。最终协议将两组默认值都设为12，并废弃已启动
+  的 Original batch16 轨迹；两组从 epoch1 重新训练。原因不仅是单批梯度统计不同，batch 还会改变每个
+  epoch 的 optimizer step 数和100-epoch OneCycleLR 的完整轨迹，不能从 batch16 checkpoint 续训。
+
+## 2026-07-17 局部 Gaussian feature：避免长期硬掩码产生假血管
+
+- 现象与假设：100-epoch hard-mask feature 模型在背景产生微小假血管。16×16 block 完全置零会把辅助任务
+  变成局部 inpainting；长期优化可能过度学习“沿上下文补出连续血管”。本轮只替换辅助分支的 corruption，
+  验证保留像素证据能否降低这种结构幻觉。
+- 实现：`train_masked.py` 新增向后兼容的 `--corruption_mode gaussian`。仍随机选取25%的16×16区域，但在
+  `log1p` 域只对选中区域加入独立 Gaussian noise，不再置零；区域图只负责扰动和圈定 encoder2/encoder3
+  feature loss，**不作为网络输入**。Gaussian 模式使用 `DenoiserWithFeats(input_channels=1)`，projector/
+  predictor 和 EMA teacher 仍只存在于训练期，checkpoint 可按原始单通道 N2N 结构推理。
+- 噪声标定：新增训练参数可读取 `scripts/measure_noise.py` 的 `recommended_sigma`；每张图独立采样
+  `sigma ~ Uniform(0.25*sigma_real, 0.75*sigma_real)`，并使用独立 noise RNG，避免改变 region/DataLoader
+  随机轨迹。辅助 forward 继续冻结 BN running statistics，只允许正常 N2N 分支维护推理统计。
+- 实验控制：新增 `scripts/run_e100_noise_feature010.sh`，固定 level4、crop512、batch12、seed42、100 epoch、
+  `w_feature=0.10`、weight decay=1e-4，与既有 Mask-C 配方一致；Original/Mask-C 的既有 E100 结果可以复用。
+  对比必须同时报告 best-validation 与 epoch100 的 ID/OOD PSNR、SSIM，以及假血管背景区域局部放大和
+  difference map。结果待服务器训练后回填，不能仅凭 loss 或平均 PSNR 判断是否消除假血管。
