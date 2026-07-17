@@ -64,6 +64,63 @@ def apply_visible_mask(
     return image * visible_mask + fill_value * (1.0 - visible_mask)
 
 
+def apply_local_gaussian_noise(
+    image: torch.Tensor,
+    visible_mask: torch.Tensor,
+    sigma_min: float,
+    sigma_max: float,
+    *,
+    generator: torch.Generator | None = None,
+    clamp_min: float | None = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """只在选中区域加入独立 Gaussian noise，并返回每张图实际采样的 sigma。
+
+    ``visible_mask`` 沿用现有约定：1 表示未扰动，0 表示被选中的区域。它只负责
+    圈定扰动和 feature loss，不需要作为网络输入。每张图从
+    ``[sigma_min, sigma_max]`` 独立均匀采样一个噪声强度。
+    """
+    sigma_min = float(sigma_min)
+    sigma_max = float(sigma_max)
+    if sigma_min < 0.0 or sigma_max < sigma_min:
+        raise ValueError(
+            f"noise sigma range must satisfy 0 <= min <= max, got {sigma_min}..{sigma_max}"
+        )
+    if image.ndim != 4:
+        raise ValueError(f"image must have shape (N,C,H,W), got {tuple(image.shape)}")
+    if visible_mask.ndim != 4 or visible_mask.shape[1] != 1:
+        raise ValueError(
+            f"visible_mask must have shape (N,1,H,W), got {tuple(visible_mask.shape)}"
+        )
+    if visible_mask.shape[0] != image.shape[0] or visible_mask.shape[-2:] != image.shape[-2:]:
+        raise ValueError(
+            f"visible_mask shape {tuple(visible_mask.shape)} is incompatible with image "
+            f"{tuple(image.shape)}"
+        )
+
+    visible = visible_mask.to(device=image.device, dtype=image.dtype).clamp(0.0, 1.0)
+    hidden = 1.0 - visible
+    if image.shape[1] != 1:
+        hidden = hidden.expand(-1, image.shape[1], -1, -1)
+
+    unit = torch.rand(
+        (image.shape[0], 1, 1, 1),
+        device=image.device,
+        dtype=image.dtype,
+        generator=generator,
+    )
+    sigmas = sigma_min + (sigma_max - sigma_min) * unit
+    noise = torch.randn(
+        image.shape,
+        device=image.device,
+        dtype=image.dtype,
+        generator=generator,
+    ) * sigmas
+    corrupted = image + hidden * noise
+    if clamp_min is not None:
+        corrupted = corrupted.clamp_min(float(clamp_min))
+    return corrupted, sigmas
+
+
 def masked_charbonnier(
     prediction: torch.Tensor,
     target: torch.Tensor,
@@ -138,6 +195,7 @@ class MaskedFeaturePredictionLoss(nn.Module):
 __all__ = [
     "make_block_visible_mask",
     "apply_visible_mask",
+    "apply_local_gaussian_noise",
     "masked_charbonnier",
     "MaskedFeaturePredictionLoss",
 ]

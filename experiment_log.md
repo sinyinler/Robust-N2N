@@ -227,3 +227,20 @@
 - 公平性修正：Original 和 feature 两组必须使用相同 batch。最终协议将两组默认值都设为12，并废弃已启动
   的 Original batch16 轨迹；两组从 epoch1 重新训练。原因不仅是单批梯度统计不同，batch 还会改变每个
   epoch 的 optimizer step 数和100-epoch OneCycleLR 的完整轨迹，不能从 batch16 checkpoint 续训。
+
+## 2026-07-17 局部 Gaussian feature：避免长期硬掩码产生假血管
+
+- 现象与假设：100-epoch hard-mask feature 模型在背景产生微小假血管。16×16 block 完全置零会把辅助任务
+  变成局部 inpainting；长期优化可能过度学习“沿上下文补出连续血管”。本轮只替换辅助分支的 corruption，
+  验证保留像素证据能否降低这种结构幻觉。
+- 实现：`train_masked.py` 新增向后兼容的 `--corruption_mode gaussian`。仍随机选取25%的16×16区域，但在
+  `log1p` 域只对选中区域加入独立 Gaussian noise，不再置零；区域图只负责扰动和圈定 encoder2/encoder3
+  feature loss，**不作为网络输入**。Gaussian 模式使用 `DenoiserWithFeats(input_channels=1)`，projector/
+  predictor 和 EMA teacher 仍只存在于训练期，checkpoint 可按原始单通道 N2N 结构推理。
+- 噪声标定：新增训练参数可读取 `scripts/measure_noise.py` 的 `recommended_sigma`；每张图独立采样
+  `sigma ~ Uniform(0.25*sigma_real, 0.75*sigma_real)`，并使用独立 noise RNG，避免改变 region/DataLoader
+  随机轨迹。辅助 forward 继续冻结 BN running statistics，只允许正常 N2N 分支维护推理统计。
+- 实验控制：新增 `scripts/run_e100_noise_feature010.sh`，固定 level4、crop512、batch12、seed42、100 epoch、
+  `w_feature=0.10`、weight decay=1e-4，与既有 Mask-C 配方一致；Original/Mask-C 的既有 E100 结果可以复用。
+  对比必须同时报告 best-validation 与 epoch100 的 ID/OOD PSNR、SSIM，以及假血管背景区域局部放大和
+  difference map。结果待服务器训练后回填，不能仅凭 loss 或平均 PSNR 判断是否消除假血管。
