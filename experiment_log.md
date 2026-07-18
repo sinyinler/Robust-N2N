@@ -350,3 +350,17 @@
 - 当前边界：数据已准备好，但现有 `data/sidd_dataset.py` 仍按 SIDD-Small 文件名只读取 `NOISY/GT_SRGB_010.PNG`；
   Medium 文件还带 scene-instance 前缀并包含 `010/011`。正式训练前必须先扩展 pair discovery，并明确是用全部 320 对训练后只在公开
   Validation/Benchmark 评估，还是继续保留 scene-disjoint internal test；本次仅完成下载与数据完整性验证，未擅自启动新训练。
+
+## 2026-07-18 SIDD-Medium scene-disjoint feature/RTV 重跑
+
+- 用户要求：数据下载后按上一轮顺序重跑，先 Gaussian feature-loss、RTV=0，再在完全相同配置上增加 `rtv_weight=1e-4`，
+  两组结束后自动评估公开 Validation blocks 和 scene008 完整图。
+- 对比协议：为了和 SIDD-Small 结果保持严格可比并避免 test leakage，继续按 scene 划分：train=`001-006,009,010`、
+  val=`007`、test=`008`。Medium 使每个 scene instance 从 1 对变为 2 对，因此 train/val/test 从 `120/20/20`
+  增加到 `240/40/40`；crop256、每 pair repeats=8、有效 batch16、20 epoch、seed42 及其余优化参数不变。
+- 数据适配：`data/sidd_dataset.py` 现在同时兼容 Small 的 `NOISY_SRGB_010.PNG` 和 Medium 带 scene-instance 前缀的
+  `*_NOISY_SRGB_010/011.PNG`，并用对应文件名自动寻找 GT；Small/Medium 发现数量分别回归验证为 160/320。
+- Medium 噪声重标定：240 个 train pair 的固定中心 256 crop 上，noisy-GT residual robust MAD sigma 中位数为
+  `0.0348847583`，因此 feature corruption 使用 `sigma ~ U(0.0087211896, 0.0261635687)`。
+- 两组各 2 optimizer-step smoke 通过：train_pairs=240、val_pairs=40、模型参数 67,614，forward/backward、EMA、
+  Gaussian feature 和 float32 RTV 均无 NaN/Inf 或 AMP skip。正式 20 epoch 结果待后台顺序训练后回填。

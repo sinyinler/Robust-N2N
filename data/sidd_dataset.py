@@ -1,4 +1,4 @@
-"""SIDD-Small sRGB 配对发现、scene 隔离和同步裁剪增强。"""
+"""SIDD-Small/Medium sRGB 配对发现、scene 隔离和同步裁剪增强。"""
 from __future__ import annotations
 
 import random
@@ -27,14 +27,19 @@ def resolve_sidd_data_dir(root: str | Path) -> Path:
     """兼容用户给外层目录、解压目录或最终 Data 目录三种写法。"""
 
     root = Path(root).expanduser().resolve()
-    direct_candidates = [root, root / "Data", root / "SIDD_Small_sRGB_Only" / "Data"]
+    direct_candidates = [
+        root,
+        root / "Data",
+        root / "SIDD_Small_sRGB_Only" / "Data",
+        root / "SIDD_Medium_Srgb" / "Data",
+    ]
     for candidate in direct_candidates:
-        if candidate.is_dir() and any(candidate.glob("*/NOISY_SRGB_010.PNG")):
+        if candidate.is_dir() and any(candidate.glob("*/*NOISY_SRGB_*.PNG")):
             return candidate
     for candidate in root.rglob("Data"):
-        if candidate.is_dir() and any(candidate.glob("*/NOISY_SRGB_010.PNG")):
+        if candidate.is_dir() and any(candidate.glob("*/*NOISY_SRGB_*.PNG")):
             return candidate.resolve()
-    raise FileNotFoundError(f"在 {root} 下没有找到 SIDD Data/scene/NOISY_SRGB_010.PNG")
+    raise FileNotFoundError(f"在 {root} 下没有找到 SIDD Data/scene/*NOISY_SRGB_*.PNG")
 
 
 def discover_sidd_pairs(root: str | Path, scenes: tuple[str, ...] | list[str] | None = None) -> list[SIDDPair]:
@@ -48,16 +53,22 @@ def discover_sidd_pairs(root: str | Path, scenes: tuple[str, ...] | list[str] | 
         scene = match.group(1)
         if allowed is not None and scene not in allowed:
             continue
-        noisy = scene_dir / "NOISY_SRGB_010.PNG"
-        gt = scene_dir / "GT_SRGB_010.PNG"
-        if not noisy.is_file() or not gt.is_file():
-            raise FileNotFoundError(f"SIDD pair 不完整: {scene_dir}")
-        with Image.open(noisy) as noisy_image, Image.open(gt) as gt_image:
-            if noisy_image.mode != "RGB" or gt_image.mode != "RGB":
-                raise ValueError(f"期望 RGB PNG: {scene_dir}")
-            if noisy_image.size != gt_image.size:
-                raise ValueError(f"NOISY/GT 尺寸不一致: {scene_dir}")
-        pairs.append(SIDDPair(scene_dir.name, scene, noisy, gt))
+        noisy_files = sorted(scene_dir.glob("*NOISY_SRGB_*.PNG"))
+        if not noisy_files:
+            raise FileNotFoundError(f"SIDD scene 中没有 noisy PNG: {scene_dir}")
+        for noisy in noisy_files:
+            gt_name = noisy.name.replace("NOISY_SRGB_", "GT_SRGB_", 1)
+            gt = scene_dir / gt_name
+            if not gt.is_file():
+                raise FileNotFoundError(f"SIDD pair 不完整: noisy={noisy}, gt={gt}")
+            with Image.open(noisy) as noisy_image, Image.open(gt) as gt_image:
+                if noisy_image.mode != "RGB" or gt_image.mode != "RGB":
+                    raise ValueError(f"期望 RGB PNG: {scene_dir}")
+                if noisy_image.size != gt_image.size:
+                    raise ValueError(f"NOISY/GT 尺寸不一致: {scene_dir}")
+            capture_id = noisy.stem.rsplit("_", 1)[-1]
+            pair_name = scene_dir.name if len(noisy_files) == 1 else f"{scene_dir.name}_{capture_id}"
+            pairs.append(SIDDPair(pair_name, scene, noisy, gt))
     if not pairs:
         raise ValueError(f"没有发现符合 scenes={scenes} 的 SIDD pair")
     return pairs
