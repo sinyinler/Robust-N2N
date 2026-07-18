@@ -363,4 +363,33 @@
 - Medium 噪声重标定：240 个 train pair 的固定中心 256 crop 上，noisy-GT residual robust MAD sigma 中位数为
   `0.0348847583`，因此 feature corruption 使用 `sigma ~ U(0.0087211896, 0.0261635687)`。
 - 两组各 2 optimizer-step smoke 通过：train_pairs=240、val_pairs=40、模型参数 67,614，forward/backward、EMA、
-  Gaussian feature 和 float32 RTV 均无 NaN/Inf 或 AMP skip。正式 20 epoch 结果待后台顺序训练后回填。
+  Gaussian feature 和 float32 RTV 均无 NaN/Inf 或 AMP skip。
+- 训练完成：两组均为 20 epoch / 9,600 optimizer steps，无 NaN、OOM 或 AMP skip。feature-only 最佳为 epoch19，
+  scene007 validation Charbonnier=`0.00857847`；feature+RTV 最佳为 epoch20，`0.00855096`。训练曲线后期基本重合，
+  因而不能仅凭 validation loss 判断 RTV。
+- 公开 Validation blocks（1,280 blocks，统一 RGB PSNR/SSIM 定义）：
+  - Medium feature-only：`36.33134 dB / 0.873008`；相对 Small feature-only 的
+    `35.29428 / 0.847705` 为 `+1.03707 dB / +0.025303`。逐 block 配对 bootstrap 95% CI 为
+    `[1.00337,1.07077] dB / [0.023802,0.026836]`，胜出 `1230/1280` blocks。
+  - Medium feature+RTV：`36.36978 dB / 0.876640`；相对 Small feature+RTV 的
+    `35.36451 / 0.853399` 为 `+1.00527 dB / +0.023242`。
+  - 在 Medium 内部，RTV 相对 feature-only 为 `+0.03843 dB / +0.003632`；95% CI
+    `[0.01936,0.05729] dB / [0.003287,0.003983]`，说明它在公开 blocks 上有小而稳定的收益。
+- scene008 完整图 internal test：feature-only 在 40 个 capture 上为 `32.37332 dB / 0.797499`，
+  feature+RTV 为 `32.33556 dB / 0.795715`。逐图配对后 RTV 变化为
+  `-0.03776 dB / -0.001784`，95% CI `[-0.07158,-0.00582] dB / [-0.003103,-0.000503]`，
+  仅胜出 `15/40 PSNR` 和 `14/40 SSIM`。因此 RTV 在完整场景上的下降不是由 010/011 数量不一致造成的。
+- Small 与 Medium 的严格同图比较只使用 capture010（20 对；noisy/GT 与 Small 对应图一致）：Medium feature-only
+  相对 Small feature-only 为 `+0.51691 dB`，95% CI `[0.20975,0.84541]`，胜出 `16/20`；SSIM
+  为 `+0.010982`，但 CI `[-0.000797,0.022504]` 跨 0。额外训练 pair 对 PSNR 的收益成立。
+- 失败案例和视觉复核：两种 Medium 模型都在 ISO100 的 `0180` 和 `0188` 两个 instance（010/011 共 4 张）
+  上低于 noisy 输入。feature-only 的 PSNR 分别下降约 `3.52/3.54 dB` 与 `1.34/1.45 dB`；RTV 进一步恶化为
+  `3.68/3.70 dB` 与 `1.68/1.79 dB`。高噪声 `0170` 的彩噪被明显压制且无 tile 接缝，但所有输出都比 GT
+  更平滑；低噪声样本的织物网格尤其明显，RTV 略加剧细节抹除。
+- 决策：扩大到 Medium 是明确有效的，当前应保留 **Medium feature-only** 作为整图默认模型；RTV=1e-4
+  只适合把公开 blocks PSNR/SSIM 作为唯一目标时使用，不能宣称对完整图普遍改善。下一轮优先做噪声强度门控、
+  identity/residual 保护或低 ISO 采样加权，而不是继续加大 RTV。
+- 产物：配对统计、失败样本、损失曲线和三张六列视觉图位于
+  `results/sidd/medium_ablation_comparison/`；最佳 checkpoint 位于
+  `results/sidd/medium_scene_split_feature_gaussian_s42/best.pt` 和
+  `results/sidd/medium_scene_split_feature_gaussian_rtv1e4_s42/best.pt`。
