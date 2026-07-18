@@ -244,3 +244,33 @@
   `w_feature=0.10`、weight decay=1e-4，与既有 Mask-C 配方一致；Original/Mask-C 的既有 E100 结果可以复用。
   对比必须同时报告 best-validation 与 epoch100 的 ID/OOD PSNR、SSIM，以及假血管背景区域局部放大和
   difference map。结果待服务器训练后回填，不能仅凭 loss 或平均 PSNR 判断是否消除假血管。
+# 2026-07-18 SIDD-Small sRGB 监督基线与公开 Validation 管线
+
+- 目的：在不下载 SIDD-Full 的前提下，用本地完整的 `SIDD_Small_sRGB_Only` 建立真实噪声
+  `NOISY -> GT` 监督基线，并为公开 SIDD Validation blocks 建立可复查的外部评测。
+- 数据核验：160 个完整 RGB pair、320 张 PNG、NOISY/GT 尺寸不匹配为 0。按 scene 隔离：
+  train=`001-006,009,010`（120 对），validation=`007`（20 对），internal test=`008`（20 对）。
+- 实现：新增独立 `data/sidd_dataset.py`、`models/sidd_rgb_denoiser.py`、`train_sidd.py`、
+  `eval_sidd.py`、`eval_sidd_blocks.py` 和 `configs/sidd_supervised.json`；原单通道 BFI/N2N
+  路径不改。RGB 网络不压灰度，输入/输出均为 3 通道，共 67,614 个参数；训练域为 `[0,1]`
+  sRGB，首轮只用 Charbonnier，RTV/feature loss 均为 0。
+- 默认训练配置：crop256；一次大图解码取 4 个同步增强 crop；image batch=4、有效 patch batch=16；
+  AdamW，lr=`1e-3 -> 1e-5` cosine，weight decay=`1e-4`，20 epoch，seed42，AMP。
+- Validation 下载：York 官方主机连接超时，公开 Google Drive `test.zip` 触发下载配额；改用
+  Hugging Face `talib-sid/sidd-val` 中由原 MAT 无损导出的 1280 对 PNG LMDB，按原 key 顺序
+  重建两个标准 MAT。两者变量均为 `uint8 (40,32,256,256,3)`。中转 LMDB 验证后已删除
+  （315,785,044 bytes），只保留：
+  - `D:/Desktop/数据集/SIDD/Validation/ValidationNoisyBlocksSrgb.mat`：229,019,520 bytes，
+    local SHA256 `5A9F84EA873A3B347103740CDE7DCEA9BF3F1012FB75828A464DAB8E868AA02C`；
+  - `D:/Desktop/数据集/SIDD/Validation/ValidationGtBlocksSrgb.mat`：229,831,366 bytes，
+    local SHA256 `D208846192DCD219B1DD17A46CC2CF931449A26CD17019E48DCE79B1CA67914F`。
+  MAT 容器由 SciPy 重建，压缩字节数/哈希不等同于官方 MATLAB 容器，但数组来自无损 PNG blocks。
+- 校验：PyTorch 2.8/CUDA 12.6/RTX 3060 上数据读取、一次 forward/backward、checkpoint 严格加载和
+  700x900 tiled inference 均通过；输出 shape 正确且无 NaN/Inf。两 step CLI smoke 的 train/val
+  Charbonnier 为 `0.25408/0.29063`，只用于程序校验，不作为实验结果。
+- 公开 Validation noisy baseline（1280 blocks）：RGB PSNR=`23.66238 dB`，SSIM=`0.333469`。
+  SSIM 明确采用 11x11 Gaussian、sigma=1.5、`data_range=1`；逐块 CSV、summary 和 5 张视觉图位于
+  `results/sidd/validation_noisy_baseline/`。这一定义用于本地一致对照；最终官方 benchmark 仍以
+  Kaggle 返回数值为准。
+- 当前结论：代码、数据、指标和可视化链路已打通；尚未把 2-step smoke 冒充去噪结果。下一步是
+  从头运行 20 epoch baseline，再用 `best.pt` 同时评估 scene008 完整图和公开 Validation blocks。
