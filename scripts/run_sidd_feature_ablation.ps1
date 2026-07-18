@@ -4,8 +4,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
-$ValidationRoot = "D:\Desktop\数据集\SIDD\Validation"
-$DataRoot = "D:\Desktop\数据集\SIDD\SIDD_Small_sRGB_Only"
+$ReferenceConfig = Get-Content -LiteralPath (Join-Path $ProjectRoot "configs\sidd_supervised_feature.json") -Encoding UTF8 | ConvertFrom-Json
+$DataRoot = $ReferenceConfig.data_root
+$ValidationRoot = Join-Path (Split-Path -Parent $DataRoot) "Validation"
 
 function Invoke-CheckedPython {
     param([string[]]$Arguments)
@@ -23,25 +24,53 @@ function Invoke-SIDDArm {
     )
 
     if (Test-Path -LiteralPath $TrainDir) {
-        throw "Training output already exists; refusing to mix trajectories: $TrainDir"
+        $HistoryPath = Join-Path $TrainDir "history.jsonl"
+        $Checkpoint = Join-Path $TrainDir "best.pt"
+        if (-not (Test-Path -LiteralPath $HistoryPath) -or
+            -not (Test-Path -LiteralPath $Checkpoint) -or
+            (Get-Content -LiteralPath $HistoryPath).Count -ne 20) {
+            throw "Incomplete training output exists; refusing to resume ambiguously: $TrainDir"
+        }
+        Write-Output "Validated completed training; resume from evaluation: $TrainDir"
+    }
+    else {
+        Invoke-CheckedPython @("train_sidd.py", "--config", $Config)
     }
 
-    Invoke-CheckedPython @("train_sidd.py", "--config", $Config)
     $Checkpoint = Join-Path $TrainDir "best.pt"
-    Invoke-CheckedPython @(
-        "eval_sidd_blocks.py",
-        "--noisy_mat", (Join-Path $ValidationRoot "ValidationNoisyBlocksSrgb.mat"),
-        "--gt_mat", (Join-Path $ValidationRoot "ValidationGtBlocksSrgb.mat"),
-        "--checkpoint", $Checkpoint,
-        "--out_dir", "results\sidd\validation_$EvalPrefix"
-    )
-    Invoke-CheckedPython @(
-        "eval_sidd.py",
-        "--data_root", $DataRoot,
-        "--checkpoint", $Checkpoint,
-        "--scenes", "008",
-        "--out_dir", "results\sidd\internal_test_scene008_$EvalPrefix"
-    )
+    $BlockEvalDir = "results\sidd\validation_$EvalPrefix"
+    if (Test-Path -LiteralPath (Join-Path $BlockEvalDir "summary.json")) {
+        Write-Output "Validated completed block evaluation: $BlockEvalDir"
+    }
+    else {
+        if (Test-Path -LiteralPath $BlockEvalDir) {
+            throw "Incomplete block evaluation output exists: $BlockEvalDir"
+        }
+        Invoke-CheckedPython @(
+            "eval_sidd_blocks.py",
+            "--noisy_mat", (Join-Path $ValidationRoot "ValidationNoisyBlocksSrgb.mat"),
+            "--gt_mat", (Join-Path $ValidationRoot "ValidationGtBlocksSrgb.mat"),
+            "--checkpoint", $Checkpoint,
+            "--out_dir", $BlockEvalDir
+        )
+    }
+
+    $FullEvalDir = "results\sidd\internal_test_scene008_$EvalPrefix"
+    if (Test-Path -LiteralPath (Join-Path $FullEvalDir "summary.json")) {
+        Write-Output "Validated completed full-image evaluation: $FullEvalDir"
+    }
+    else {
+        if (Test-Path -LiteralPath $FullEvalDir) {
+            throw "Incomplete full-image evaluation output exists: $FullEvalDir"
+        }
+        Invoke-CheckedPython @(
+            "eval_sidd.py",
+            "--data_root", $DataRoot,
+            "--checkpoint", $Checkpoint,
+            "--scenes", "008",
+            "--out_dir", $FullEvalDir
+        )
+    }
 }
 
 Set-Location -LiteralPath $ProjectRoot
