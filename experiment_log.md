@@ -274,3 +274,26 @@
   Kaggle 返回数值为准。
 - 当前结论：代码、数据、指标和可视化链路已打通；尚未把 2-step smoke 冒充去噪结果。下一步是
   从头运行 20 epoch baseline，再用 `best.pt` 同时评估 scene008 完整图和公开 Validation blocks。
+
+## 2026-07-18 SIDD 监督基线训练完成与双重评估
+
+- 训练完成：20 epoch、4800 optimizer steps；train Charbonnier 从 `0.140206` 降到 `0.013278`，validation
+  从 `0.069786` 降到 `0.009648`。最佳 checkpoint 为 epoch 19，validation=`0.009596`；epoch 20 仅轻微回升，
+  没有明显过拟合。checkpoint 与曲线位于 `results/sidd/supervised_charbonnier_s42/`。
+- 公开 SIDD Validation blocks（1280 blocks，和 noisy baseline 使用完全相同的本地 RGB 指标定义）：
+  noisy=`23.66238 dB / 0.333469 SSIM`，模型=`35.17941 dB / 0.845399 SSIM`，增益
+  `+11.51703 dB / +0.511930`；paired bootstrap 95% CI 分别为 `[11.38497, 11.64759] dB` 和
+  `[0.505619, 0.518158]`。PSNR 胜出 `1280/1280` blocks，SSIM 胜出 `1279/1280` blocks。
+  结果位于 `results/sidd/validation_trained/`。这属于公开 Validation 本地评估，不是隐藏 GT 的官方 benchmark 分数。
+- scene-disjoint internal test（scene 008，20 张完整高分辨率图，tile 512/overlap 64）：
+  noisy=`26.46744 dB / 0.555477 SSIM`，模型=`31.83252 dB / 0.786656 SSIM`，增益
+  `+5.36508 dB / +0.231179`；instance bootstrap 95% CI 分别为 `[3.45692, 7.13857] dB` 和
+  `[0.143378, 0.314838]`。PSNR 胜出 `18/20`，SSIM 胜出 `16/20`。这些实例共享同一 held-out scene 内容，
+  因而 CI 只能作为内部诊断，不能当成跨场景泛化置信区间。结果位于 `results/sidd/internal_test_scene008/`。
+- 失败样本集中在已经很干净的 ISO 100 输入：`0180_008_GP_00100_00100_5500_N` 为
+  `31.5265 -> 27.7523 dB`、`0.8788 -> 0.7072 SSIM`；`0188_008_IP_00100_00100_3200_N` 为
+  `31.9034 -> 29.2139 dB`、`0.8784 -> 0.7969 SSIM`。当前非 noise-aware 模型会对低噪声图继续强去噪，
+  导致布料细纹理被抹除。
+- 视觉结论：高噪声区域的彩色噪声显著减少、未观察到 tile 拼接缝或明显颜色漂移；但细密布料纹理存在
+  可见过度平滑。基线已证明真实 RGB noisy-to-GT 监督链路有效，下一阶段的主要问题是低噪声自适应与保纹理，
+  不是简单增加 epoch。
