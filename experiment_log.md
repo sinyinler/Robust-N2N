@@ -328,3 +328,25 @@
   结论仍限于单 seed、公开 Validation 和单个 held-out scene，不能等同于隐藏 GT 的官方 benchmark；在扩大模型/训练轮数前，优先解决低 ISO 自适应与纹理保持。
 - 产物：三组配对统计、CI、曲线和高/低噪声五列视觉图位于 `results/sidd/ablation_comparison/`；最佳 checkpoint 分别位于
   `results/sidd/supervised_feature_gaussian_s42/best.pt` 和 `results/sidd/supervised_feature_gaussian_rtv1e4_s42/best.pt`。
+
+## 2026-07-18 SIDD-Medium sRGB 下载、校验与解压
+
+- 目的：把训练数据从 SIDD-Small 的每个 scene instance 一对图扩展到论文常用的 SIDD-Medium sRGB（每个 scene instance 两对图），
+  同时区分 SIDD-Medium 与不适合本机磁盘容量的 SIDD-Full。
+- 官方来源：`http://130.63.97.225/share/SIDD_Medium_Srgb.zip`；官网标称约 12 GB，实际压缩包
+  `13,234,744,070 bytes = 12.326 GiB`。下载到 `E:/SIDD/SIDD_Medium_Srgb.zip`，解压目录为
+  `E:/SIDD/SIDD_Medium_Srgb/`。
+- 下载过程：官方单连接续传仅约 20--45 KiB/s，改用官网同一 URL 的 aria2 16 段 Range 续传，平均约 3.7 MiB/s。
+  aria2 1.37.0 Windows 64-bit 工具来自官方 GitHub release，工具压缩包 SHA256
+  `67D015301EEF0B612191212D564C5BB0A14B5B9C4796B76454276A4D28D9B288`。
+- 官方完整性校验全部通过：MD5=`F95B4BC9EC1DD3FE4EBD61AEACAD3991`；
+  SHA1=`B0F895258112DB896D6ADE0A8DDAFC8CFC9BD54D`。解压后为 160 个 scene instance、320 对 noisy/GT、
+  640 张 RGB PNG；逐对尺寸不匹配为 0，解压文件总量约 12.325 GiB。
+- SIDD-Full 容量核算：官网 Full 清单中的 320 个 sRGB 压缩分卷（160 scene instance × noisy/GT）Content-Length
+  合计 `986,172,587,651 bytes = 918.445 GiB`，还不含 Raw-RGB 和 metadata；E 盘下载前只有约 245.4 GiB 空闲，
+  因此不能在该盘保存 SIDD-Full。对标准 sRGB 监督训练，应使用 SIDD-Medium，而不是全量采集帧。
+- 新增可复用脚本：`scripts/download_sidd_medium.ps1` 支持断点续传和多连接；
+  `scripts/verify_extract_sidd_medium.ps1` 强制检查字节数、MD5、SHA1、解压结果和 320/320 图像计数。
+- 当前边界：数据已准备好，但现有 `data/sidd_dataset.py` 仍按 SIDD-Small 文件名只读取 `NOISY/GT_SRGB_010.PNG`；
+  Medium 文件还带 scene-instance 前缀并包含 `010/011`。正式训练前必须先扩展 pair discovery，并明确是用全部 320 对训练后只在公开
+  Validation/Benchmark 评估，还是继续保留 scene-disjoint internal test；本次仅完成下载与数据完整性验证，未擅自启动新训练。
