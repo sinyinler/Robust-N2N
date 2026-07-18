@@ -297,3 +297,34 @@
 - 视觉结论：高噪声区域的彩色噪声显著减少、未观察到 tile 拼接缝或明显颜色漂移；但细密布料纹理存在
   可见过度平滑。基线已证明真实 RGB noisy-to-GT 监督链路有效，下一阶段的主要问题是低噪声自适应与保纹理，
   不是简单增加 epoch。
+
+## 2026-07-18 SIDD Gaussian feature-loss 与 RTV 消融
+
+- 目的：在完全相同的 SIDD-Small scene-disjoint 划分、网络、优化器、20 epoch 和 seed42 下，从头训练两个单变量递进实验：
+  1. `NOISY -> GT + Gaussian masked feature prediction`，`rtv_weight=0`；
+  2. 在 1 的基础上增加 `rtv_weight=1e-4`。
+- feature 分支只在训练期存在：随机选择 25% 的 16x16 区域，在该区域加入 `sigma ~ U(0.0072677, 0.0218030)` 的 Gaussian noise；
+  student predictor 对齐 GT 的 EMA teacher encoder2/encoder3 特征，`feature_weight=0.10`。推理网络和基线完全同构，仍为 67,614 参数，
+  不增加推理参数或额外噪声。噪声与 feature-loss 绑定，不作用于主监督输入。
+- 训练健康：两组均完成 20 epoch/4,800 steps，无 NaN、AMP skip 或发散。feature-only 最佳为 epoch19，scene007 validation
+  Charbonnier=`0.00941634`；feature+RTV 最佳为 epoch19，`0.00953235`；纯监督基线为 epoch19，`0.00959633`。
+- 公开 SIDD Validation blocks（1280 blocks，RGB PSNR/SSIM）：
+  - baseline：`35.17941 / 0.845399`；
+  - feature-only：`35.29428 / 0.847705`，相对 baseline `+0.11486 dB / +0.002306`；配对 bootstrap 95% CI
+    `[0.09225,0.13700] dB / [0.001768,0.002826]`；胜出 `848/1280 PSNR`、`957/1280 SSIM`；
+  - feature+RTV：`35.36451 / 0.853399`，相对 baseline `+0.18510 dB / +0.008000`；相对 feature-only
+    `+0.07024 dB / +0.005694`，增量 95% CI `[0.04956,0.09133] dB / [0.005295,0.006106]`，
+    胜出 `861/1280 PSNR`、`1121/1280 SSIM`。
+- scene008 完整图 internal test（20 instances，tile512/overlap64）：
+  - baseline：`31.83252 / 0.786656`；
+  - feature-only：`31.87815 / 0.787629`，相对 baseline `+0.04563 dB / +0.000973`；PSNR CI 不跨 0，SSIM CI 跨 0；
+  - feature+RTV：`31.92025 / 0.790455`，相对 baseline `+0.08773 dB / +0.003798`，95% CI
+    `[0.03083,0.14546] dB / [0.000522,0.007335]`；相对 feature-only `+0.04210 dB / +0.002825`，
+    95% CI `[0.01363,0.07133] dB / [0.001595,0.004079]`，20 张中两项均胜出 15 张。
+- 视觉复核：高噪声 `0170` 中 feature 和 RTV 都降低彩噪，RTV 未观察到新增假结构或 tile 接缝；但三个模型都明显抹平 GT 的织物网格。
+  低 ISO `0180/0188` 仍是主要失败点：输入约 `31.53/31.90 dB`，feature+RTV 仅 `27.90/29.17 dB`，说明当前模型仍会对已较干净图像过度去噪。
+  RTV 相对 feature-only 在这些样本没有一致恶化，但也没有解决 noise-aware 问题。
+- 决策：`feature+RTV(1e-4)` 是当前三组中量化指标最好的配置，可以作为下一阶段候选；feature-loss 的独立收益成立，低权重 RTV 也有额外收益。
+  结论仍限于单 seed、公开 Validation 和单个 held-out scene，不能等同于隐藏 GT 的官方 benchmark；在扩大模型/训练轮数前，优先解决低 ISO 自适应与纹理保持。
+- 产物：三组配对统计、CI、曲线和高/低噪声五列视觉图位于 `results/sidd/ablation_comparison/`；最佳 checkpoint 分别位于
+  `results/sidd/supervised_feature_gaussian_s42/best.pt` 和 `results/sidd/supervised_feature_gaussian_rtv1e4_s42/best.pt`。
