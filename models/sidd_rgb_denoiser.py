@@ -33,7 +33,7 @@ class SIDDRGBDenoiser(nn.Module):
         self.decoder3 = Light_Residual_block(48, 16, 3, 1)
         self.output = nn.Conv2d(16, 3, kernel_size=1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_feats: bool = False):
         out1 = self.encoder1(x)
         out2 = self.encoder2(out1)
         out3 = self.encoder3(out2)
@@ -45,12 +45,21 @@ class SIDDRGBDenoiser(nn.Module):
         dec2 = self.decoder2(torch.cat((up2, out2), dim=1))
         up3 = F.interpolate(dec2, size=out1.shape[-2:], mode="bilinear", align_corners=False)
         dec3 = self.decoder3(torch.cat((up3, out1), dim=1))
-        return self.output(dec3)
+        output = self.output(dec3)
+        if return_feats:
+            # 顺序与单通道 feature 分支一致，训练配置按名称选择实际监督尺度。
+            return output, [out1, out2, out3, bridge]
+        return output
+
+
+SIDD_FEAT_NAMES = ("encoder1", "encoder2", "encoder3", "bottleneck")
+SIDD_FEAT_CHANNELS = (16, 32, 64, 80)
 
 
 if __name__ == "__main__":
     model = SIDDRGBDenoiser()
     sample = torch.rand(2, 3, 256, 256)
-    output = model(sample)
+    output, features = model(sample, return_feats=True)
     print("output", tuple(output.shape))
+    print("features", [tuple(feature.shape) for feature in features])
     print("params", sum(p.numel() for p in model.parameters()))

@@ -72,6 +72,7 @@ def apply_local_gaussian_noise(
     *,
     generator: torch.Generator | None = None,
     clamp_min: float | None = 0.0,
+    clamp_max: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """只在选中区域加入独立 Gaussian noise，并返回每张图实际采样的 sigma。
 
@@ -118,6 +119,8 @@ def apply_local_gaussian_noise(
     corrupted = image + hidden * noise
     if clamp_min is not None:
         corrupted = corrupted.clamp_min(float(clamp_min))
+    if clamp_max is not None:
+        corrupted = corrupted.clamp_max(float(clamp_max))
     return corrupted, sigmas
 
 
