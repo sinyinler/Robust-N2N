@@ -393,3 +393,20 @@
   `results/sidd/medium_ablation_comparison/`；最佳 checkpoint 位于
   `results/sidd/medium_scene_split_feature_gaussian_s42/best.pt` 和
   `results/sidd/medium_scene_split_feature_gaussian_rtv1e4_s42/best.pt`。
+
+## 2026-07-23 Reference 仿射光度漂移诊断
+
+- 目的：针对 5x5 长训练实验中“PSNR 大幅下降但 Pearson r 下降较小、部分图像出现整体亮度偏移”的现象，
+  区分全局亮度/对比度漂移与真实结构退化。
+- 新增可选评估诊断：对每张模型输出和 reference 的公共中心区域，以最小二乘拟合
+  `reference ≈ a * output + b`，再报告原始及仿射校正后的 PSNR/MSSIM/r、`a`、`b`、
+  `output/reference` 均值比和标准差比。校正值不裁剪，以保持两参数最小二乘诊断的定义。
+- 边界：`a,b` 的拟合直接使用 reference，因此校正后的指标只能用于定位误差来源，不能作为正式 benchmark
+  结果、可部署推理结果或论文主表指标；正式结果仍是未校正的原始模型输出。
+- 接口：`eval_curve.py` 新增 `--photometric_diagnostic 1`；逐帧字段追加到 `per_frame.csv`，
+  汇总写入 `photometric_diagnostic_summary.json`，校正前后 PSNR 与亮度/对比度比值曲线写入
+  `photometric_diagnostic_curve.png`。不开启开关时保持原评估输出和 `run_curve` 三数组返回接口。
+- 验证：3 个 NumPy 单元测试通过，包括已知映射 `reference=1.75*output-12.5` 的参数精确恢复、
+  不同尺寸公共中心裁剪以及常量输出的退化解；评估脚本与新增模块均通过语法检查。
+- 当前状态：本地没有服务器 checkpoint 和 `/mnt2/songyd/5x5` 数据，尚未记录 seed187 的实际
+  `a,b` 与校正增益；需要在训练服务器上重新推理 F1 与 B1/B0 后再据实判断。
