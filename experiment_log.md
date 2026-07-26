@@ -410,3 +410,30 @@
   不同尺寸公共中心裁剪以及常量输出的退化解；评估脚本与新增模块均通过语法检查。
 - 当前状态：本地没有服务器 checkpoint 和 `/mnt2/songyd/5x5` 数据，尚未记录 seed187 的实际
   `a,b` 与校正增益；需要在训练服务器上重新推理 F1 与 B1/B0 后再据实判断。
+
+## 2026-07-26 raw 域局部 Gamma feature：seed187 亮度漂移压力测试
+
+- 动机：现有 feature arm 在 `log1p` 后加入 Gaussian noise，并将负值截断到 0；暗区截断会引入正偏，
+  而 seed187 是既有实验中亮度漂移最严重的随机种子。本轮按用户确认只把辅助 corruption 替换为 raw 域
+  Gamma，主 N2N、feature loss、RTV、区域采样、优化器和 seed 控制均保持不变。
+- 实现（commit `8371147`）：对模型输入先用 `expm1` 回到 raw 域，只在随机 25% 的 16×16 区域乘
+  `factor ~ Gamma(k, rate=k)`，其中每张图 `CV ~ U(0.025,0.075)`、`k=1/CV²`，再以 `log1p`
+  返回模型域。因 `E[factor]=1`，raw 域亮度在期望上不变；Gamma 路径不调用 Gaussian，也不执行
+  `clamp_min(0)`。旧 Gaussian 路径仅为历史结果可复现而保留。
+- 配置：seed=`187`，crop=`512`，本地 GPU=`RTX 3060 12GB`，batch=`8`，`w_feature=0.10`，
+  `rtv_weight=0.01`，weight decay=`1e-4`，feature scales=`encoder2/encoder3`，EMA=`0.996`；
+  其余正式 E100 参数与 `run_e100_noise_feature010.sh` 一致。本地正式入口为
+  `scripts/run_local_e100_gamma_feature010.ps1`，启动前强制核验期望场景数和每场景 1000 帧。
+- 验证：
+  - 5 个单元测试全部通过；Gamma seed/RNG 可复现、未选区域逐元素保持不变，大样本 raw 均值比在
+    `1±1e-3` 内。原 Gaussian smoke 回归通过。
+  - CUDA feature smoke：hidden=`0.25`、平均 CV=`0.0555`、扰动区域 raw 均值比=`1.001354`；
+    backward、EMA 和单通道 N2N checkpoint 兼容检查通过。
+  - 512×512 完整两步显存探测包含 AdamW state 和首步 encoder2/encoder3 梯度诊断：
+    batch8 peak allocated=`8.027 GiB`、peak reserved=`8.793 GiB`，因此本地固定 batch8。
+  - scene0 真实数据两-batch pilot 完成，无 NaN/OOM；平均 CV=`0.05331`、hidden=`0.25`、
+    扰动区域 raw 均值比=`1.00005`、raw 均值差=`0.00098`。pilot checkpoint 与诊断位于
+    `results/smoke_gamma_seed187_b8_v2/`。
+- 边界与下一步：pilot 仅验证实现、亮度统计与显存，不代表去噪效果；没有据此报告 PSNR/SSIM 或视觉结论。
+  Level4 下载仍未完成（记录时 scene0=1000 帧，scene1 仍在增长）。数据完整后启动 seed187 E100，
+  必须同时比较未校正 PSNR/SSIM/r、raw 平均亮度比、仿射诊断，以及全图/细血管/背景假血管局部放大图。
