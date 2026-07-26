@@ -423,7 +423,8 @@
 - 配置：seed=`187`，crop=`512`，本地 GPU=`RTX 3060 12GB`，batch=`8`，`w_feature=0.10`，
   `rtv_weight=0.01`，weight decay=`1e-4`，feature scales=`encoder2/encoder3`，EMA=`0.996`；
   其余正式 E100 参数与 `run_e100_noise_feature010.sh` 一致。本地正式入口为
-  `scripts/run_local_e100_gamma_feature010.ps1`，启动前强制核验期望场景数和每场景 1000 帧。
+  `scripts/run_local_e100_gamma_feature010.ps1`，启动前强制核验期望场景数及每个变长序列的
+  `0.npy..(N-1).npy` 连续性。
 - 验证：
   - 5 个单元测试全部通过；Gamma seed/RNG 可复现、未选区域逐元素保持不变，大样本 raw 均值比在
     `1±1e-3` 内。原 Gaussian smoke 回归通过。
@@ -435,5 +436,6 @@
     扰动区域 raw 均值比=`1.00005`、raw 均值差=`0.00098`。pilot checkpoint 与诊断位于
     `results/smoke_gamma_seed187_b8_v2/`。
 - 边界与下一步：pilot 仅验证实现、亮度统计与显存，不代表去噪效果；没有据此报告 PSNR/SSIM 或视觉结论。
-  Level4 下载仍未完成（记录时 scene0=1000 帧，scene1 仍在增长）。数据完整后启动 seed187 E100，
-  必须同时比较未校正 PSNR/SSIM/r、raw 平均亮度比、仿射诊断，以及全图/细血管/背景假血管局部放大图。
+  Level4 随后核验为 39 个变长 scene、19,760 帧，全部带 meta 且帧编号连续，随机抽取 20 个 NPY
+  均可读取；据此启动 seed187 E100。完成后必须同时比较未校正 PSNR/SSIM/r、raw 平均亮度比、
+  仿射诊断，以及全图/细血管/背景假血管局部放大图。

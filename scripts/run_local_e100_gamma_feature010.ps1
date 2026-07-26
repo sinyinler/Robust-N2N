@@ -5,7 +5,8 @@ param(
     [int]$Seed = 187,
     [Parameter(Mandatory = $true)]
     [int]$ExpectedScenes,
-    [int]$ExpectedFramesPerScene = 1000
+    [int]$ExpectedFramesPerScene = 0,
+    [switch]$PreflightOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,35 +19,83 @@ if ($LevelName -ne "5x5x4") {
 if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
     throw "Cannot find the denoise environment Python: $PythonPath"
 }
-if ($Batch -le 0 -or $ExpectedScenes -le 0 -or $ExpectedFramesPerScene -le 0) {
-    throw "Batch, ExpectedScenes, and ExpectedFramesPerScene must be positive"
+if ($Batch -le 0 -or $ExpectedScenes -le 0 -or $ExpectedFramesPerScene -lt 0) {
+    throw "Batch/ExpectedScenes must be positive and ExpectedFramesPerScene cannot be negative"
 }
 
-# 正式训练前强制检查下载完整性，避免把下载中的局部数据误当成完整 Level4。
-$SceneDirs = Get-ChildItem -LiteralPath $ResolvedLevelDir -Directory |
-    Where-Object { $_.Name -match '^\d+$' } |
-    Sort-Object { [int]($_.Name) }
-$SceneDirs = @($SceneDirs)
+# Refuse to train on a partial Level4 download.
+$SceneDirs = New-Object System.Collections.ArrayList
+foreach ($CandidateDir in Get-ChildItem -LiteralPath $ResolvedLevelDir -Directory) {
+    if (
+        $CandidateDir.Name -match '^\d+$' -and
+        (Test-Path -LiteralPath (Join-Path $CandidateDir.FullName "npy") -PathType Container)
+    ) {
+        [void]$SceneDirs.Add($CandidateDir)
+    }
+}
 if ($SceneDirs.Count -ne $ExpectedScenes) {
     throw "Incomplete Level4 scene count: current=$($SceneDirs.Count), expected=$ExpectedScenes"
 }
 $Incomplete = @()
 foreach ($SceneDir in $SceneDirs) {
     $NpyDir = Join-Path $SceneDir.FullName "npy"
-    $FrameCount = if (Test-Path -LiteralPath $NpyDir -PathType Container) {
-        @(Get-ChildItem -LiteralPath $NpyDir -File -Filter "*.npy").Count
+    $FrameFiles = if (Test-Path -LiteralPath $NpyDir -PathType Container) {
+        @(Get-ChildItem -LiteralPath $NpyDir -File -Filter "*.npy")
     } else {
-        0
+        @()
     }
-    if ($FrameCount -ne $ExpectedFramesPerScene) {
+    $FrameCount = $FrameFiles.Count
+    if ($FrameCount -lt 2) {
+        $Incomplete += "$($SceneDir.Name):only-$FrameCount-frames"
+        continue
+    }
+    if ($ExpectedFramesPerScene -gt 0 -and $FrameCount -ne $ExpectedFramesPerScene) {
         $Incomplete += "$($SceneDir.Name):$FrameCount"
+        continue
+    }
+
+    # Variable-length scenes must contain contiguous 0.npy..(N-1).npy indices.
+    $Indices = [System.Collections.Generic.List[int]]::new()
+    foreach ($FrameFile in $FrameFiles) {
+        if ($FrameFile.BaseName -match '^\d+$') {
+            $Indices.Add([Convert]::ToInt32($FrameFile.BaseName))
+        } else {
+            $Indices.Add(-1)
+        }
+    }
+    $Indices.Sort()
+    if ($Indices[0] -ne 0 -or $Indices[-1] -ne ($FrameCount - 1)) {
+        $Incomplete += "$($SceneDir.Name):non-contiguous"
+        continue
+    }
+    for ($Index = 0; $Index -lt $FrameCount; $Index++) {
+        if ($Indices[$Index] -ne $Index) {
+            $Incomplete += "$($SceneDir.Name):non-contiguous"
+            break
+        }
     }
 }
 if ($Incomplete.Count -gt 0) {
-    throw "Incomplete Level4 frame counts (expected $ExpectedFramesPerScene each): $($Incomplete -join ', ')"
+    $ExpectedText = if ($ExpectedFramesPerScene -gt 0) {
+        "$ExpectedFramesPerScene frames per scene"
+    } else {
+        "contiguous variable-length sequences"
+    }
+    throw "Incomplete Level4 data (expected $ExpectedText): $($Incomplete -join ', ')"
 }
 
 $DataRoot = Split-Path -Parent $ResolvedLevelDir
+$TotalFrames = 0
+foreach ($SceneDir in $SceneDirs) {
+    $TotalFrames += @(Get-ChildItem -LiteralPath (Join-Path $SceneDir.FullName "npy") -File -Filter "*.npy").Count
+}
+Write-Host "[INFO] data=$DataRoot level=$LevelName scenes=$($SceneDirs.Count) frames=$TotalFrames"
+Write-Host "[INFO] seed=$Seed batch=$Batch gamma_cv=[0.025,0.075]"
+if ($PreflightOnly) {
+    Write-Host "[OK] Level4 preflight completed; training was not started"
+    exit 0
+}
+
 $SaveDir = Join-Path $ProjectRoot "results\checkpoints\gammatune_E100_feature_w010_b${Batch}_s${Seed}"
 $RunLogDir = Join-Path $ProjectRoot "results\logs\E100_gamma_feature010_b${Batch}_s${Seed}"
 $RunLog = Join-Path $RunLogDir "gamma_feature_w010.log"
@@ -56,8 +105,6 @@ if (Test-Path -LiteralPath $SaveDir) {
 New-Item -ItemType Directory -Path $RunLogDir -Force | Out-Null
 
 $GitCommit = (& git -C $ProjectRoot rev-parse --short HEAD 2>$null)
-Write-Host "[INFO] data=$DataRoot level=$LevelName scenes=$($SceneDirs.Count)"
-Write-Host "[INFO] seed=$Seed batch=$Batch gamma_cv=[0.025,0.075]"
 Write-Host "[INFO] python=$PythonPath git=$GitCommit"
 
 $TrainArgs = @(
