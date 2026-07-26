@@ -442,3 +442,11 @@
 - 首次正式启动在完成数据加载、报告 `2446 batches/epoch` 后，被 Windows PowerShell 5 将 tqdm 的正常
   stderr 误包装为 `NativeCommandError` 而终止，尚未进入 optimizer step；该失败目录保留并改名标记。
   启动器随后在调用 Python 期间局部使用 `ErrorActionPreference=Continue`，仍以原生 exit code 判定真正失败。
+- 修正启动器后 batch8 正常进入训练，但完整进程实测占用 `12036/12288 MiB`、仅余 `78 MiB`；为避免
+  桌面进程显存波动导致长跑随机 OOM，在 epoch1 第 19 step 主动停止，未产生 epoch checkpoint。
+- 正式长跑改为唯一允许变化的显存参数 batch6，其余配置与 seed187 均不变。启动 commit=`d035f38`，
+  `3261 batches/epoch`；跨过 step100/200 的 encoder2/encoder3 梯度诊断点后仍稳定，GPU 利用率约
+  `98%`、显存 `10452/12288 MiB`（余量约 `1662 MiB`）、温度约 `71°C`，稳态约 `2.8 batch/s`。
+  预计每 epoch 约 19–20 分钟、E100 约 32–34 小时。正式输出为
+  `results/checkpoints/gammatune_E100_feature_w010_b6_s187/`，运行日志为
+  `results/logs/E100_gamma_feature010_b6_s187/gamma_feature_w010.log`。
