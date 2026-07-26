@@ -439,3 +439,6 @@
   Level4 随后核验为 39 个变长 scene、19,760 帧，全部带 meta 且帧编号连续，随机抽取 20 个 NPY
   均可读取；据此启动 seed187 E100。完成后必须同时比较未校正 PSNR/SSIM/r、raw 平均亮度比、
   仿射诊断，以及全图/细血管/背景假血管局部放大图。
+- 首次正式启动在完成数据加载、报告 `2446 batches/epoch` 后，被 Windows PowerShell 5 将 tqdm 的正常
+  stderr 误包装为 `NativeCommandError` 而终止，尚未进入 optimizer step；该失败目录保留并改名标记。
+  启动器随后在调用 Python 期间局部使用 `ErrorActionPreference=Continue`，仍以原生 exit code 判定真正失败。

@@ -148,13 +148,20 @@ $TrainArgs = @(
 )
 
 Push-Location $ProjectRoot
+$PreviousErrorActionPreference = $ErrorActionPreference
+$TrainingExitCode = -1
 try {
+    # Windows PowerShell 5 wraps native stderr (including normal tqdm output)
+    # as NativeCommandError when ErrorActionPreference=Stop.
+    $ErrorActionPreference = "Continue"
     & $PythonPath @TrainArgs 2>&1 | Tee-Object -FilePath $RunLog
-    if ($LASTEXITCODE -ne 0) {
-        throw "Gamma training failed with exit code $LASTEXITCODE; log: $RunLog"
-    }
+    $TrainingExitCode = $LASTEXITCODE
 } finally {
+    $ErrorActionPreference = $PreviousErrorActionPreference
     Pop-Location
+}
+if ($TrainingExitCode -ne 0) {
+    throw "Gamma training failed with exit code $TrainingExitCode; log: $RunLog"
 }
 
 Write-Host "[OK] 100-epoch raw-domain local Gamma feature training completed: $SaveDir"
