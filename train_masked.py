@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Train N2N with region-based masked or Gaussian feature prediction.
+"""Train N2N with region-based masked, Gaussian, or Gamma feature prediction.
 
 Normal branch:
     n1 -> student -> y1,                    L_n2n = Charb(y1, n2)
@@ -7,6 +7,9 @@ Masked branch:
     mask(n1) -> student -> y_mask/F_mask,   L_mask_pixel on hidden pixels
 Gaussian branch:
     n1 + local noise -> single-channel student -> F_noise,
+    L_mask_feature on perturbed locations (the region map is not a model input)
+Gamma branch:
+    log1p(raw * local Gamma factor) -> single-channel student -> F_noise,
     L_mask_feature on perturbed locations (the region map is not a model input)
 Teacher branch (only when feature weight > 0):
     n2 -> EMA teacher -> F_target,           L_mask_feature on hidden locations
@@ -35,6 +38,7 @@ from losses.rtv import RTVRegularizer
 from losses.masked_prediction import (
     MaskedFeaturePredictionLoss,
     apply_local_gaussian_noise,
+    apply_local_gamma_noise,
     apply_visible_mask,
     make_block_visible_mask,
     masked_charbonnier,
@@ -144,7 +148,9 @@ def compute_gradient_diagnostics(
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="N2N + region-based masked/Gaussian feature prediction")
+    p = argparse.ArgumentParser(
+        description="N2N + region-based masked/Gaussian/Gamma feature prediction"
+    )
     # Data arguments consumed by train_n2n.build_loaders.
     p.add_argument("--data_path", required=True)
     p.add_argument("--data_subdir", default="npy")
@@ -190,8 +196,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="")
 
     # Region-based auxiliary objectives. The default keeps historical mask runs unchanged.
-    p.add_argument("--corruption_mode", choices=["mask", "gaussian"], default="mask",
-                   help="mask=历史双通道硬遮挡；gaussian=单通道局部加噪，区域图不输入网络")
+    p.add_argument("--corruption_mode", choices=["mask", "gaussian", "gamma"], default="mask",
+                   help="mask=历史双通道硬遮挡；gaussian=log域局部加噪；gamma=raw域局部乘性噪声")
     p.add_argument("--mask_ratio", type=float, default=0.25)
     p.add_argument("--mask_patch", type=int, default=16)
     p.add_argument("--mask_fill", choices=["zero", "mean"], default="zero")
@@ -210,7 +216,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mask_seed_offset", type=int, default=20_001,
                    help="mask generator seed = seed + offset")
     p.add_argument("--noise_seed_offset", type=int, default=40_001,
-                   help="Gaussian noise generator seed = seed + offset")
+                   help="Gaussian/Gamma corruption generator seed = seed + offset")
     p.add_argument("--noise_stats_json", default="",
                    help="measure_noise.py 输出；gaussian 模式默认读取 recommended_sigma")
     p.add_argument("--noise_sigma", type=float, default=0.0,
@@ -219,6 +225,10 @@ def parse_args() -> argparse.Namespace:
                    help="每张图 sigma 下界 = reference sigma * 此比例")
     p.add_argument("--noise_sigma_max_scale", type=float, default=0.75,
                    help="每张图 sigma 上界 = reference sigma * 此比例")
+    p.add_argument("--gamma_cv_min", type=float, default=0.025,
+                   help="Gamma 模式每张图乘性因子 CV 的采样下界")
+    p.add_argument("--gamma_cv_max", type=float, default=0.075,
+                   help="Gamma 模式每张图乘性因子 CV 的采样上界")
     p.add_argument("--predictor_seed_offset", type=int, default=30_001,
                    help="feature predictor seed = seed + offset，且不推进全局 Torch RNG")
     p.add_argument("--grad_diag_every", type=int, default=0,
@@ -252,13 +262,17 @@ def parse_args() -> argparse.Namespace:
     if (args.noise_sigma_min_scale < 0
             or args.noise_sigma_max_scale < args.noise_sigma_min_scale):
         raise ValueError("noise sigma scales must satisfy 0 <= min <= max")
-    if args.corruption_mode == "gaussian" and args.w_mask_pixel > 0:
-        raise ValueError("gaussian mode does not use pixel inpainting; set --w_mask_pixel 0")
-    if args.corruption_mode == "gaussian" and args.w_mask_feature <= 0:
-        raise ValueError("gaussian mode requires --w_mask_feature > 0")
+    if args.gamma_cv_min <= 0 or args.gamma_cv_max < args.gamma_cv_min:
+        raise ValueError("gamma CV range must satisfy 0 < min <= max")
+    if args.corruption_mode in {"gaussian", "gamma"} and args.w_mask_pixel > 0:
+        raise ValueError("noise corruption modes do not use pixel inpainting; set --w_mask_pixel 0")
+    if args.corruption_mode in {"gaussian", "gamma"} and args.w_mask_feature <= 0:
+        raise ValueError("noise corruption modes require --w_mask_feature > 0")
     if (args.corruption_mode == "gaussian" and args.noise_sigma <= 0
             and not args.noise_stats_json):
         raise ValueError("gaussian mode requires --noise_sigma > 0 or --noise_stats_json")
+    if args.corruption_mode == "gamma" and args.intensity_transform != "log1p":
+        raise ValueError("gamma mode currently requires --intensity_transform log1p")
     if args.grad_diag_every < 0:
         raise ValueError("grad_diag_every must be non-negative")
     if args.grad_diag_every > 0 and not args.grad_diag_scales:
@@ -311,7 +325,7 @@ def validate(model, loader, charb, rtv, args, device) -> float:
             break
         n1 = n1.to(device, non_blocking=True)
         n2 = n2.to(device, non_blocking=True)
-        y = model(n1)  # mask 模式自动补全 all-visible；Gaussian 模式直接使用单通道输入。
+        y = model(n1)  # mask 模式自动补全 all-visible；噪声模式直接使用单通道输入。
         loss = charb(y, n2) + args.rtv_weight * rtv(y)
         total += float(loss)
         steps += 1
@@ -332,10 +346,10 @@ def train(args: argparse.Namespace) -> None:
     )
 
     _, train_loader, val_loader = build_loaders(args)
-    # Gaussian 模式恢复真正的单通道结构；随机区域只供扰动和 loss 使用，不喂给模型。
+    # Gaussian/Gamma 模式恢复真正的单通道结构；随机区域只供扰动和 loss 使用，不喂给模型。
     student: nn.Module = (
         DenoiserWithFeats(input_channels=1)
-        if args.corruption_mode == "gaussian"
+        if args.corruption_mode in {"gaussian", "gamma"}
         else MaskedDenoiserWithFeats(image_channels=1)
     ).to(device)
     teacher: nn.Module | None = None
@@ -387,11 +401,17 @@ def train(args: argparse.Namespace) -> None:
     )
     if args.corruption_mode == "mask":
         print(f"[INFO] mask fill={args.mask_fill}; model input=image+visibility channel")
-    else:
+    elif args.corruption_mode == "gaussian":
         print(
             f"[INFO] local Gaussian sigma(log-domain) reference={noise_sigma_ref:.6g} "
             f"range=[{noise_sigma_min:.6g}, {noise_sigma_max:.6g}]; "
             "model input=image only"
+        )
+    else:
+        print(
+            f"[INFO] local Gamma factor(raw-domain) CV range="
+            f"[{args.gamma_cv_min:.6g}, {args.gamma_cv_max:.6g}]; "
+            "E[factor]=1; model input=image only"
         )
     print(
         f"[INFO] loss = N2N + {args.w_mask_pixel}*mask_pixel + "
@@ -426,6 +446,9 @@ def train(args: argparse.Namespace) -> None:
             per_scale: list[float] = []
             actual_hidden = 0.0
             sampled_noise_sigma = 0.0
+            sampled_gamma_cv = 0.0
+            raw_hidden_mean_ratio = 1.0
+            raw_hidden_mean_delta = 0.0
             if use_corruption:
                 visible = make_block_visible_mask(
                     n1.shape[0], n1.shape[2], n1.shape[3], args.mask_ratio, args.mask_patch,
@@ -434,7 +457,7 @@ def train(args: argparse.Namespace) -> None:
                 actual_hidden = float((1.0 - visible).mean())
                 if args.corruption_mode == "mask":
                     corrupted_n1 = apply_visible_mask(n1, visible, fill=args.mask_fill)
-                else:
+                elif args.corruption_mode == "gaussian":
                     corrupted_n1, sampled_sigmas = apply_local_gaussian_noise(
                         n1,
                         visible,
@@ -444,6 +467,26 @@ def train(args: argparse.Namespace) -> None:
                         clamp_min=0.0,
                     )
                     sampled_noise_sigma = float(sampled_sigmas.mean())
+                else:
+                    corrupted_n1, sampled_cvs = apply_local_gamma_noise(
+                        n1,
+                        visible,
+                        args.gamma_cv_min,
+                        args.gamma_cv_max,
+                        generator=noise_generator,
+                    )
+                    sampled_gamma_cv = float(sampled_cvs.mean())
+                    with torch.no_grad():
+                        hidden = 1.0 - visible
+                        raw_before = torch.expm1(n1)
+                        raw_after = torch.expm1(corrupted_n1)
+                        hidden_count = hidden.sum().clamp_min(1.0)
+                        mean_before = (raw_before * hidden).sum() / hidden_count
+                        mean_after = (raw_after * hidden).sum() / hidden_count
+                        raw_hidden_mean_ratio = float(
+                            mean_after / mean_before.clamp_min(1e-12)
+                        )
+                        raw_hidden_mean_delta = float(mean_after - mean_before)
 
                 # 辅助分支仍使用当前 batch statistics 和 BN affine 参数梯度，
                 # 但不允许它污染 all-visible 推理所依赖的 running statistics。
@@ -531,6 +574,9 @@ def train(args: argparse.Namespace) -> None:
                 "weighted_mask_feature": float(weighted_mask_feature.detach()),
                 "hidden": actual_hidden,
                 "noise_sigma": sampled_noise_sigma,
+                "gamma_cv": sampled_gamma_cv,
+                "raw_hidden_mean_ratio": raw_hidden_mean_ratio,
+                "raw_hidden_mean_delta": raw_hidden_mean_delta,
             }
             for i, value in enumerate(per_scale):
                 logs[f"mask_feat_{args.mask_feature_scales[i]}"] = value
@@ -550,11 +596,11 @@ def train(args: argparse.Namespace) -> None:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         if args.plot_loss_curve:
             try:
-                curve_title = (
-                    "Local-Gaussian N2N with feature prediction"
-                    if args.corruption_mode == "gaussian"
-                    else "Masked N2N with feature prediction"
-                )
+                curve_title = {
+                    "mask": "Masked N2N with feature prediction",
+                    "gaussian": "Local-Gaussian N2N with feature prediction",
+                    "gamma": "Raw-domain local-Gamma N2N with feature prediction",
+                }[args.corruption_mode]
                 update_training_curves(history_path, curve_title)
             except Exception as error:
                 # 绘图是只读诊断，不能因为可视化异常中断长时间训练。
@@ -566,7 +612,7 @@ def train(args: argparse.Namespace) -> None:
             "args": vars(args),
             "model_type": (
                 "noise_feature_single_channel"
-                if args.corruption_mode == "gaussian"
+                if args.corruption_mode in {"gaussian", "gamma"}
                 else "masked_feature_two_channel"
             ),
         }

@@ -124,6 +124,69 @@ def apply_local_gaussian_noise(
     return corrupted, sigmas
 
 
+def apply_local_gamma_noise(
+    log_image: torch.Tensor,
+    visible_mask: torch.Tensor,
+    cv_min: float,
+    cv_max: float,
+    *,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """只在选中区域施加 raw 域 Gamma 乘性噪声。
+
+    输入必须是 ``log1p`` 域的非负图像。每张图独立采样
+    ``CV ~ Uniform(cv_min, cv_max)``，再令
+    ``factor ~ Gamma(k, rate=k)``、``k=1/CV^2``。因此 factor 的均值为 1，
+    raw 域扰动在期望上不改变亮度。未选中区域直接复用原张量，避免
+    ``expm1 -> log1p`` 往返产生数值差异。
+    """
+    cv_min = float(cv_min)
+    cv_max = float(cv_max)
+    if cv_min <= 0.0 or cv_max < cv_min:
+        raise ValueError(
+            f"gamma CV range must satisfy 0 < min <= max, got {cv_min}..{cv_max}"
+        )
+    if log_image.ndim != 4:
+        raise ValueError(
+            f"log_image must have shape (N,C,H,W), got {tuple(log_image.shape)}"
+        )
+    if visible_mask.ndim != 4 or visible_mask.shape[1] != 1:
+        raise ValueError(
+            f"visible_mask must have shape (N,1,H,W), got {tuple(visible_mask.shape)}"
+        )
+    if (
+        visible_mask.shape[0] != log_image.shape[0]
+        or visible_mask.shape[-2:] != log_image.shape[-2:]
+    ):
+        raise ValueError(
+            f"visible_mask shape {tuple(visible_mask.shape)} is incompatible with "
+            f"log_image {tuple(log_image.shape)}"
+        )
+    visible = visible_mask.to(device=log_image.device, dtype=log_image.dtype).clamp(0.0, 1.0)
+    hidden = 1.0 - visible
+    if log_image.shape[1] != 1:
+        visible = visible.expand(-1, log_image.shape[1], -1, -1)
+        hidden = hidden.expand(-1, log_image.shape[1], -1, -1)
+
+    unit = torch.rand(
+        (log_image.shape[0], 1, 1, 1),
+        device=log_image.device,
+        dtype=log_image.dtype,
+        generator=generator,
+    )
+    cvs = cv_min + (cv_max - cv_min) * unit
+    shapes = cvs.reciprocal().square()
+    expanded_shapes = shapes.expand_as(log_image)
+
+    # torch.distributions.Gamma 不接收独立 generator；底层标准 Gamma sampler
+    # 支持 generator，可保持 region/DataLoader/corruption 三条随机轨迹相互隔离。
+    factors = torch._standard_gamma(expanded_shapes, generator=generator) / expanded_shapes
+    raw = torch.expm1(log_image)
+    corrupted_hidden = torch.log1p(raw * factors)
+    corrupted = log_image * visible + corrupted_hidden * hidden
+    return corrupted, cvs
+
+
 def masked_charbonnier(
     prediction: torch.Tensor,
     target: torch.Tensor,
@@ -199,6 +262,7 @@ __all__ = [
     "make_block_visible_mask",
     "apply_visible_mask",
     "apply_local_gaussian_noise",
+    "apply_local_gamma_noise",
     "masked_charbonnier",
     "MaskedFeaturePredictionLoss",
 ]
