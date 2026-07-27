@@ -450,3 +450,23 @@
   预计每 epoch 约 19–20 分钟、E100 约 32–34 小时。正式输出为
   `results/checkpoints/gammatune_E100_feature_w010_b6_s187/`，运行日志为
   `results/logs/E100_gamma_feature010_b6_s187/gamma_feature_w010.log`。
+
+## 2026-07-27 seed187 Gamma E100：外部中断诊断与 epoch61 恢复
+
+- 中断事实：batch6 长跑在 `2026-07-27 12:43:11` 停于 epoch62、batch2948/3261；最后完整记录与
+  checkpoint 均为 epoch61（`12:25:18`）。日志末尾没有 Traceback、CUDA OOM、KeyboardInterrupt
+  或正常退出标记；Windows 同时段没有重启、休眠、资源耗尽、Python 崩溃或 NVIDIA driver 事件。
+  原进程绑定的 Codex PTY session 3001 已被回收，因此判定为外部终止，而非训练数值或显存故障。
+- 修复（commit `7e397bb`）：`train_masked.py` 新增 `--resume_checkpoint`，恢复 student、EMA teacher
+  与 feature predictor；校验 seed、batch、噪声、loss、OneCycle 等关键配置及 history/checkpoint epoch
+  一致性。旧 checkpoint 未保存 optimizer/scheduler/RNG，因此本次将 OneCycleLR 定位到 epoch61 末，
+  但 AdamW moments 与随机流按确定性新 seed 重新初始化；该不连续性必须在最终结果说明中保留。
+- 后续可靠性：新 checkpoint 开始同时保存 optimizer、scheduler、global step、Python/NumPy/Torch/CUDA、
+  mask、Gamma noise、train/validation DataLoader RNG 状态，后续可在 epoch 边界严格续训。恢复段使用独立
+  `grad_diagnostics_resume_epoch_62.jsonl`，保留原先未完成 epoch62 的诊断记录而不混入重复 step。
+- 启动器：支持 `-ResumeCheckpoint`，日志以 append 方式写入；后台默认 `Progress=0`，不再把每个 batch
+  的 tqdm 输出持续送入终端，避免再次形成约百 MB 的 PTY 输出。正式恢复使用隐藏、独立 PowerShell
+  后台进程，stdout/stderr 单独落盘，不依赖 Codex task 生命周期。
+- 验证：Python 与 PowerShell 语法检查通过；8 个 `unittest` 全部通过，其中新增测试覆盖 OneCycleLR
+  global-step 定位、全部随机状态 round-trip 以及关键配置不匹配拒绝逻辑。恢复启动与 epoch62 实际运行状态
+  待下一条记录补充。
