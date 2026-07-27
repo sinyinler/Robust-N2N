@@ -6,6 +6,8 @@ param(
     [Parameter(Mandatory = $true)]
     [int]$ExpectedScenes,
     [int]$ExpectedFramesPerScene = 0,
+    [string]$ResumeCheckpoint = "",
+    [int]$Progress = 0,
     [switch]$PreflightOnly
 )
 
@@ -99,7 +101,12 @@ if ($PreflightOnly) {
 $SaveDir = Join-Path $ProjectRoot "results\checkpoints\gammatune_E100_feature_w010_b${Batch}_s${Seed}"
 $RunLogDir = Join-Path $ProjectRoot "results\logs\E100_gamma_feature010_b${Batch}_s${Seed}"
 $RunLog = Join-Path $RunLogDir "gamma_feature_w010.log"
-if (Test-Path -LiteralPath $SaveDir) {
+if ($ResumeCheckpoint) {
+    $ResumeCheckpoint = (Resolve-Path -LiteralPath $ResumeCheckpoint).Path
+    if (-not (Test-Path -LiteralPath $SaveDir -PathType Container)) {
+        throw "Resume output directory does not exist: $SaveDir"
+    }
+} elseif (Test-Path -LiteralPath $SaveDir) {
     throw "Output directory already exists; refusing to mix histories: $SaveDir"
 }
 New-Item -ItemType Directory -Path $RunLogDir -Force | Out-Null
@@ -142,10 +149,18 @@ $TrainArgs = @(
     "--grad_diag_scales", "encoder2", "encoder3",
     "--data_parallel", "0",
     "--plot_loss_curve", "1",
+    "--progress", "$Progress",
     "--seed", "$Seed",
     "--device", "cuda",
     "--save_dir", $SaveDir
 )
+if ($ResumeCheckpoint) {
+    $TrainArgs += @("--resume_checkpoint", $ResumeCheckpoint)
+    Write-Host "[INFO] resume=$ResumeCheckpoint progress=$Progress"
+    Add-Content -LiteralPath $RunLog -Value (
+        "`r`n[LAUNCH RESUME] $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') checkpoint=$ResumeCheckpoint"
+    )
+}
 
 Push-Location $ProjectRoot
 $PreviousErrorActionPreference = $ErrorActionPreference
@@ -154,7 +169,7 @@ try {
     # Windows PowerShell 5 wraps native stderr (including normal tqdm output)
     # as NativeCommandError when ErrorActionPreference=Stop.
     $ErrorActionPreference = "Continue"
-    & $PythonPath @TrainArgs 2>&1 | Tee-Object -FilePath $RunLog
+    & $PythonPath @TrainArgs 2>&1 | Tee-Object -FilePath $RunLog -Append
     $TrainingExitCode = $LASTEXITCODE
 } finally {
     $ErrorActionPreference = $PreviousErrorActionPreference

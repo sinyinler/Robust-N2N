@@ -22,6 +22,7 @@ import argparse
 import copy
 import json
 import random
+import warnings
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
@@ -181,6 +182,8 @@ def parse_args() -> argparse.Namespace:
 
     # Optimization.
     p.add_argument("--save_dir", default="results/checkpoints/masked_n2n")
+    p.add_argument("--resume_checkpoint", default="",
+                   help="从 epoch checkpoint 继续训练；旧 checkpoint 将恢复模型并重建学习率进度")
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--lr", type=float, default=0.01, help="alias for lr_max")
     p.add_argument("--lr_max", type=float, default=None)
@@ -238,6 +241,8 @@ def parse_args() -> argparse.Namespace:
                    help="梯度诊断作用层；不改变实际 loss 或反向传播")
     p.add_argument("--plot_loss_curve", type=int, default=1,
                    help="1=每个 epoch 自动更新 loss_curve.png 和 loss_history.csv")
+    p.add_argument("--progress", type=int, default=1,
+                   help="1=显示逐 batch tqdm；后台训练建议设为 0，避免终端输出过大")
 
     args = p.parse_args()
     args.data_index_min = None if args.data_index_min < 0 else args.data_index_min
@@ -313,6 +318,121 @@ def resolve_noise_sigma(args: argparse.Namespace) -> tuple[float, float, float]:
     )
 
 
+RESUME_CRITICAL_ARGS = (
+    "epochs",
+    "batch_size",
+    "crop_size",
+    "intervals",
+    "intensity_transform",
+    "corruption_mode",
+    "mask_ratio",
+    "mask_patch",
+    "gamma_cv_min",
+    "gamma_cv_max",
+    "w_mask_pixel",
+    "w_mask_feature",
+    "mask_feature_scales",
+    "mask_feature_weights",
+    "predictor_hidden_ratio",
+    "ema_decay",
+    "feature_warmup_frac",
+    "freeze_masked_bn_stats",
+    "deterministic_loader_rng",
+    "lr_max",
+    "lr_final",
+    "warmup_pct",
+    "rtv_weight",
+    "weight_decay",
+    "seed",
+)
+
+
+def validate_resume_args(checkpoint_args: dict, args: argparse.Namespace) -> None:
+    """拒绝用关键配置不一致的 checkpoint 静默续训。"""
+    mismatches = []
+    current = vars(args)
+    for key in RESUME_CRITICAL_ARGS:
+        if key in checkpoint_args and checkpoint_args[key] != current.get(key):
+            mismatches.append(
+                f"{key}: checkpoint={checkpoint_args[key]!r}, current={current.get(key)!r}"
+            )
+    if mismatches:
+        raise ValueError("resume checkpoint configuration mismatch:\n  " + "\n  ".join(mismatches))
+
+
+def read_last_history_epoch(history_path: Path) -> int:
+    """读取最后一个完整 epoch；history 只在 epoch 完成后追加。"""
+    if not history_path.is_file():
+        return 0
+    last_epoch = 0
+    with history_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                last_epoch = int(json.loads(line)["epoch"])
+    return last_epoch
+
+
+def position_onecycle_after_steps(scheduler, completed_steps: int) -> None:
+    """旧 checkpoint 没有 scheduler state 时，将 OneCycleLR 定位到原全程进度。"""
+    if completed_steps <= 0:
+        return
+    scheduler.last_epoch = completed_steps - 1
+    scheduler._step_count = completed_steps
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        scheduler.step()
+
+
+def capture_rng_state(
+    train_loader,
+    val_loader,
+    mask_generator: torch.Generator,
+    noise_generator: torch.Generator,
+) -> dict:
+    """保存 epoch 边界处的全部可控随机状态，供下一次严格续训。"""
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+        "mask_generator": mask_generator.get_state(),
+        "noise_generator": noise_generator.get_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    train_generator = getattr(train_loader, "generator", None)
+    if train_generator is not None:
+        state["train_loader_generator"] = train_generator.get_state()
+    if val_loader is not None:
+        val_generator = getattr(val_loader, "generator", None)
+        if val_generator is not None:
+            state["val_loader_generator"] = val_generator.get_state()
+    return state
+
+
+def restore_rng_state(
+    state: dict,
+    train_loader,
+    val_loader,
+    mask_generator: torch.Generator,
+    noise_generator: torch.Generator,
+) -> None:
+    """恢复 epoch 边界处的随机状态。"""
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch_cpu"])
+    if torch.cuda.is_available() and "torch_cuda" in state:
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+    mask_generator.set_state(state["mask_generator"])
+    noise_generator.set_state(state["noise_generator"])
+    train_generator = getattr(train_loader, "generator", None)
+    if train_generator is not None and "train_loader_generator" in state:
+        train_generator.set_state(state["train_loader_generator"])
+    if val_loader is not None:
+        val_generator = getattr(val_loader, "generator", None)
+        if val_generator is not None and "val_loader_generator" in state:
+            val_generator.set_state(state["val_loader_generator"])
+
+
 @torch.no_grad()
 def validate(model, loader, charb, rtv, args, device) -> float:
     if loader is None:
@@ -341,9 +461,6 @@ def train(args: argparse.Namespace) -> None:
     args.resolved_noise_sigma_max = noise_sigma_max
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
-    (save_dir / "run_config.json").write_text(
-        json.dumps(vars(args), indent=2, ensure_ascii=False), encoding="utf-8"
-    )
 
     _, train_loader, val_loader = build_loaders(args)
     # Gaussian/Gamma 模式恢复真正的单通道结构；随机区域只供扰动和 loss 使用，不喂给模型。
@@ -395,6 +512,99 @@ def train(args: argparse.Namespace) -> None:
     mask_generator.manual_seed(args.seed + args.mask_seed_offset)
     noise_generator = torch.Generator(device=device)
     noise_generator.manual_seed(args.seed + args.noise_seed_offset)
+
+    history_path = save_dir / "history.jsonl"
+    start_epoch = 1
+    global_step = 0
+    resume_mode = "fresh"
+    if args.resume_checkpoint:
+        resume_path = Path(args.resume_checkpoint)
+        if not resume_path.is_file():
+            raise FileNotFoundError(f"resume checkpoint not found: {resume_path}")
+        checkpoint = torch.load(
+            resume_path,
+            map_location=device,
+            weights_only=False,
+        )
+        if not isinstance(checkpoint, dict) or "model" not in checkpoint or "epoch" not in checkpoint:
+            raise ValueError(f"not a train_masked epoch checkpoint: {resume_path}")
+        validate_resume_args(checkpoint.get("args", {}), args)
+        completed_epoch = int(checkpoint["epoch"])
+        if completed_epoch < 1 or completed_epoch >= args.epochs:
+            raise ValueError(
+                f"resume epoch must satisfy 1 <= epoch < {args.epochs}, got {completed_epoch}"
+            )
+        history_epoch = read_last_history_epoch(history_path)
+        if history_epoch != completed_epoch:
+            raise ValueError(
+                f"history/checkpoint mismatch: history={history_epoch}, checkpoint={completed_epoch}"
+            )
+
+        unwrap(student).load_state_dict(checkpoint["model"], strict=True)
+        if feature_loss is not None:
+            if "feature_predictor" not in checkpoint:
+                raise ValueError("resume checkpoint is missing feature_predictor")
+            feature_loss.load_state_dict(checkpoint["feature_predictor"], strict=True)
+        if teacher is not None:
+            if "teacher" not in checkpoint:
+                raise ValueError("resume checkpoint is missing teacher")
+            unwrap(teacher).load_state_dict(checkpoint["teacher"], strict=True)
+
+        start_epoch = completed_epoch + 1
+        if "optimizer" in checkpoint and "scheduler" in checkpoint and "rng_state" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            scheduler.load_state_dict(checkpoint["scheduler"])
+            global_step = int(checkpoint.get("global_step", completed_epoch * len(train_loader)))
+            restore_rng_state(
+                checkpoint["rng_state"],
+                train_loader,
+                val_loader,
+                mask_generator,
+                noise_generator,
+            )
+            resume_mode = "exact"
+        else:
+            # 旧 checkpoint 没有 optimizer/RNG；模型、EMA 和 predictor 可完整恢复，
+            # OneCycleLR 定位到原全程位置，但 AdamW moments 与随机流只能重新初始化。
+            global_step = completed_epoch * len(train_loader)
+            position_onecycle_after_steps(scheduler, global_step)
+            mask_generator.manual_seed(args.seed + args.mask_seed_offset + global_step)
+            noise_generator.manual_seed(args.seed + args.noise_seed_offset + global_step)
+            train_generator = getattr(train_loader, "generator", None)
+            if train_generator is not None:
+                train_generator.manual_seed(args.seed + 10_001 + completed_epoch)
+            if val_loader is not None:
+                val_generator = getattr(val_loader, "generator", None)
+                if val_generator is not None:
+                    val_generator.manual_seed(args.seed + 10_002 + completed_epoch)
+            resume_mode = "legacy_weights_and_schedule"
+            print(
+                "[WARN] legacy checkpoint has no optimizer/scheduler/RNG state; "
+                "restored model/teacher/predictor and OneCycleLR position, "
+                "but AdamW moments and random streams were reinitialized"
+            )
+
+        print(
+            f"[RESUME] checkpoint={resume_path} completed_epoch={completed_epoch} "
+            f"start_epoch={start_epoch} global_step={global_step} mode={resume_mode} "
+            f"lr={scheduler.get_last_lr()[0]:.8g}"
+        )
+
+    run_config = vars(args).copy()
+    run_config.update({
+        "resume_mode": resume_mode,
+        "start_epoch": start_epoch,
+        "initial_global_step": global_step,
+    })
+    config_path = (
+        save_dir / f"resume_config_epoch_{start_epoch}.json"
+        if args.resume_checkpoint
+        else save_dir / "run_config.json"
+    )
+    config_path.write_text(
+        json.dumps(run_config, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
     print(
         f"[INFO] device={device} batches={len(train_loader)} corruption={args.corruption_mode} "
         f"enabled={use_corruption} ratio={args.mask_ratio} patch={args.mask_patch}"
@@ -428,15 +638,21 @@ def train(args: argparse.Namespace) -> None:
         f"grad_diag_every={args.grad_diag_every} grad_diag_scales={args.grad_diag_scales}"
     )
 
-    history_path = save_dir / "history.jsonl"
-    grad_diagnostics_path = save_dir / "grad_diagnostics.jsonl"
-    global_step = 0
-    for epoch in range(1, args.epochs + 1):
+    grad_diagnostics_path = (
+        save_dir / f"grad_diagnostics_resume_epoch_{start_epoch}.jsonl"
+        if args.resume_checkpoint
+        else save_dir / "grad_diagnostics.jsonl"
+    )
+    for epoch in range(start_epoch, args.epochs + 1):
         student.train()
         if feature_loss is not None:
             feature_loss.train()
         running: dict[str, float] = {}
-        pbar = tqdm(train_loader, desc=f"{args.corruption_mode.title()} feature N2N {epoch}/{args.epochs}")
+        pbar = tqdm(
+            train_loader,
+            desc=f"{args.corruption_mode.title()} feature N2N {epoch}/{args.epochs}",
+            disable=not bool(args.progress),
+        )
         for batch_index, (n1, n2) in enumerate(pbar):
             n1 = n1.to(device, non_blocking=True)
             n2 = n2.to(device, non_blocking=True)
@@ -610,6 +826,15 @@ def train(args: argparse.Namespace) -> None:
             "model": unwrap(student).state_dict(),
             "epoch": epoch,
             "args": vars(args),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "global_step": global_step,
+            "rng_state": capture_rng_state(
+                train_loader,
+                val_loader,
+                mask_generator,
+                noise_generator,
+            ),
             "model_type": (
                 "noise_feature_single_channel"
                 if args.corruption_mode in {"gaussian", "gamma"}
