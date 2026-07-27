@@ -468,5 +468,9 @@
   的 tqdm 输出持续送入终端，避免再次形成约百 MB 的 PTY 输出。正式恢复使用隐藏、独立 PowerShell
   后台进程，stdout/stderr 单独落盘，不依赖 Codex task 生命周期。
 - 验证：Python 与 PowerShell 语法检查通过；8 个 `unittest` 全部通过，其中新增测试覆盖 OneCycleLR
-  global-step 定位、全部随机状态 round-trip 以及关键配置不匹配拒绝逻辑。恢复启动与 epoch62 实际运行状态
-  待下一条记录补充。
+  global-step 定位、全部随机状态 round-trip 以及关键配置不匹配拒绝逻辑。
+- 恢复启动：代码版本 `8e72b7d`，隐藏后台 launcher PID=`3332`、Python PID=`40216`；恢复行确认
+  `completed_epoch=61`、`start_epoch=62`、`global_step=198921`、LR=`0.0042623697`。首个新梯度
+  心跳在 epoch62 batch79/global step199000 写入，N2N loss=`0.23619`、weighted feature=`0.01655`；
+  当时 GPU=`99%`、显存=`10991/12288 MiB`、温度=`70°C`，stderr 为空。由此确认模型加载、forward、
+  backward、optimizer 与诊断写入均已实际运行，而非仅停留在初始化阶段。
