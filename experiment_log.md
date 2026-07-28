@@ -504,3 +504,28 @@
   `per_frame.csv` 为正式逐帧结果，`psnr_curve.png` 为 500 帧曲线，
   `photometric_diagnostic_curve.png`/`photometric_diagnostic_summary.json` 为亮度诊断，
   `representative_frame_112/comparison_with_zoom.png` 为视觉与局部放大对照。
+
+## 2026-07-28 seed187 Gamma E100：Level1 前 500 帧 OOD reference 评估
+
+- 评估对象与口径：保持上一条的 epoch100 checkpoint、`reference.npy`、raw/log1p/raw 推理流程、
+  `data_range=255` 及 PSNR/skimage MSSIM/Pearson r 完全不变，只把输入替换为用户指定的
+  `D:\Desktop\Robust-N2N\npy`（Level1）自然排序前 500 帧，即 `0.npy..499.npy`。目录共 1000 帧，
+  输入与 reference 均为 `1208×1352`；逐帧 CSV 复核为 500 行、500 个唯一帧、无无效数值。
+- Level1 正式结果（mean±sample std；min–max）：
+  - PSNR：`31.13591±1.56905 dB`；`25.6562–32.8839 dB`。
+  - MSSIM：`0.840195±0.012355`；`0.7883–0.8559`。
+  - Pearson r：`0.858374±0.008646`；`0.8205–0.8756`。
+- 与同 checkpoint 的 Level4 场景 0 前 500 帧相比，Level1 平均 PSNR=`-1.96538 dB`、
+  MSSIM=`-0.028226`、r=`-0.033084`；PSNR 帧间 std 从 `0.6842` 增至 `1.5690 dB`。因此不仅平均质量
+  下降，跨帧稳定性也显著恶化。
+- 光度诊断（仅诊断）：Level1 平均 `a=0.91369`、`b=-0.40172`，output/reference mean
+  ratio=`1.12986`，即输出平均偏亮约 `13.0%`，明显差于 Level4 的 `1.00797`；std ratio=`0.95790`。
+  reference 拟合后 PSNR=`32.551 dB`、平均增加 `1.415 dB`，MSSIM=`0.8516`、r=`0.8584`。
+  校正增益远高于 Level4 的 `0.527 dB`，说明 Level1 误差中包含更强的系统性光度分量；校正值仍不属于
+  正式 benchmark。
+- 视觉核验：选择 Level1 PSNR 最接近总体均值的 frame147（PSNR=`31.1417`、MSSIM=`0.8434`、
+  r=`0.8525`）。输出相对 reference 明显偏亮、背景发灰，细血管被平滑或融合，局部可见 reference
+  中不明显的暗斑/纹理伪影。Gamma corruption 没有消除 Level1 OOD 下的亮度泛化和过平滑问题。
+- 输出目录：`results/eval_curve/gamma_E100_b6_s187_level1_first500_reference/`；正式逐帧结果为
+  `per_frame.csv`，曲线为 `psnr_curve.png` 与 `photometric_diagnostic_curve.png`，代表帧全图和
+  192×192 中心局部放大为 `representative_frame_147/comparison_with_zoom.png`。
