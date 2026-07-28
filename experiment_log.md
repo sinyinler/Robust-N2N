@@ -474,3 +474,33 @@
   心跳在 epoch62 batch79/global step199000 写入，N2N loss=`0.23619`、weighted feature=`0.01655`；
   当时 GPU=`99%`、显存=`10991/12288 MiB`、温度=`70°C`，stderr 为空。由此确认模型加载、forward、
   backward、optimizer 与诊断写入均已实际运行，而非仅停留在初始化阶段。
+
+## 2026-07-28 seed187 Gamma E100：场景 0 前 500 帧 reference 评估
+
+- 评估对象：恢复训练已完整生成 `model_epoch_100.pth`；使用该 checkpoint 对
+  `D:\Desktop\5x5x4\0\npy` 自然排序后的 `0.npy..499.npy` 共 500 帧推理，reference 固定为
+  `D:\Desktop\Robust-N2N\reference.npy`。两者均为 `1208×1352`；推理与正式指标口径为
+  `raw → log1p → model → expm1`，在 raw 域以固定 `data_range=255` 计算 PSNR、skimage MSSIM
+  和 Pearson r，不使用 reference 拟合后的数值替代正式指标。
+- 兼容修复（commit `80c1ae9`）：新 checkpoint 含 NumPy RNG/optimizer/scheduler，PyTorch 2.6+
+  默认 `weights_only=True` 会拒绝加载完整 payload。`utils/checkpoint.py` 对本项目自产 trusted
+  checkpoint 显式使用 `weights_only=False`；83/83 个推理模型参数成功匹配，skipped=0。8 个现有
+  `unittest` 及语法检查通过。
+- 正式 500 帧结果（mean±sample std；min–max）：
+  - PSNR：`33.1013±0.6842 dB`；`27.6314–34.0424 dB`。
+  - MSSIM：`0.86842±0.00440`；`0.8257–0.8756`。
+  - Pearson r：`0.89146±0.00616`；`0.8641–0.9046`。
+  - `per_frame.csv` 复核为 500 行、frame 0–499、500 个唯一帧、无 NaN。
+- 光度诊断（仅诊断）：逐帧拟合 `reference ≈ a·output+b` 后，平均 `a=1.08292`、`b=-1.81143`；
+  output/reference mean ratio=`1.00797`，说明全局均值仅约 `+0.8%`，没有此前那种严重整体亮度漂移；
+  但 std ratio=`0.83301`，表明输出对比度平均压缩约 `16.7%`。reference 拟合后 PSNR 为
+  `33.629 dB`、平均增加 `0.527 dB`，MSSIM=`0.8724`、r=`0.8915`；这些校正值不能作为部署或
+  benchmark 指标。
+- 视觉核验：选择正式 PSNR 最接近 500 帧均值的 frame112（PSNR=`33.1017`、MSSIM=`0.8702`、
+  r=`0.8969`）生成 noisy / denoised / reference 全图及中心 192×192 放大。去噪结果明显抑制散斑，
+  但相对 reference 呈现显著平滑和对比度压缩；局部细血管有变粗、变淡或被抹平的现象。依据项目判据，
+  当前 Gamma 方案不能仅凭平均 PSNR 判定成功。
+- 输出目录：`results/eval_curve/gamma_E100_b6_s187_scene0_first500_reference/`，其中
+  `per_frame.csv` 为正式逐帧结果，`psnr_curve.png` 为 500 帧曲线，
+  `photometric_diagnostic_curve.png`/`photometric_diagnostic_summary.json` 为亮度诊断，
+  `representative_frame_112/comparison_with_zoom.png` 为视觉与局部放大对照。
