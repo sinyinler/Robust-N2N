@@ -187,6 +187,140 @@ def apply_local_gamma_noise(
     return corrupted, cvs
 
 
+def split_hidden_regions_by_patch(
+    visible_mask: torch.Tensor,
+    patch: int,
+    gamma_probability: float,
+    *,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split selected patches into mutually exclusive Gamma/Gaussian regions.
+
+    ``visible_mask`` follows the project convention: one means unperturbed and
+    zero means selected for the auxiliary feature task. Each selected patch is
+    assigned to Gamma with ``gamma_probability`` and to Gaussian otherwise.
+    The two returned hidden regions are disjoint and their union exactly equals
+    the original hidden region.
+    """
+    patch = int(patch)
+    gamma_probability = float(gamma_probability)
+    if patch <= 0:
+        raise ValueError(f"patch must be positive, got {patch}")
+    if not 0.0 <= gamma_probability <= 1.0:
+        raise ValueError(
+            "gamma_probability must be in [0,1], "
+            f"got {gamma_probability}"
+        )
+    if visible_mask.ndim != 4 or visible_mask.shape[1] != 1:
+        raise ValueError(
+            "visible_mask must have shape (N,1,H,W), "
+            f"got {tuple(visible_mask.shape)}"
+        )
+
+    batch, _, height, width = visible_mask.shape
+    gh = math.ceil(height / patch)
+    gw = math.ceil(width / patch)
+    scores = torch.rand(
+        (batch, gh * gw),
+        device=visible_mask.device,
+        generator=generator,
+    )
+
+    # The incoming region mask is block-constant. Sample exactly the requested
+    # fraction among its selected grid cells instead of using Bernoulli draws,
+    # so the 50/50 experiment has a fixed corruption budget per image.
+    hidden_grid = (1.0 - visible_mask[:, :, ::patch, ::patch]).reshape(batch, -1)
+    assignment_grid = torch.zeros_like(hidden_grid)
+    for sample_index in range(batch):
+        selected = torch.nonzero(hidden_grid[sample_index] > 0.5, as_tuple=False).flatten()
+        gamma_cells = int(round(selected.numel() * gamma_probability))
+        if gamma_cells > 0:
+            order = scores[sample_index, selected].topk(
+                gamma_cells, largest=True, sorted=False
+            ).indices
+            assignment_grid[sample_index, selected[order]] = 1.0
+    assignment = assignment_grid.view(batch, 1, gh, gw)
+    assignment = assignment.repeat_interleave(patch, dim=2).repeat_interleave(
+        patch, dim=3
+    )[..., :height, :width]
+
+    visible = visible_mask.clamp(0.0, 1.0)
+    hidden = 1.0 - visible
+    gamma_hidden = hidden * assignment
+    gaussian_hidden = hidden * (1.0 - assignment)
+    gamma_visible = 1.0 - gamma_hidden
+    gaussian_visible = 1.0 - gaussian_hidden
+
+    hidden_count = hidden.flatten(1).sum(dim=1).clamp_min(1.0)
+    gamma_fraction = gamma_hidden.flatten(1).sum(dim=1) / hidden_count
+    return gamma_visible, gaussian_visible, gamma_fraction
+
+
+def apply_local_hybrid_noise(
+    log_image: torch.Tensor,
+    visible_mask: torch.Tensor,
+    patch: int,
+    gamma_probability: float,
+    gamma_cv_min: float,
+    gamma_cv_max: float,
+    gaussian_sigma_min: float,
+    gaussian_sigma_max: float,
+    *,
+    strategy: str,
+    gamma_generator: torch.Generator | None = None,
+    gaussian_generator: torch.Generator | None = None,
+    choice_generator: torch.Generator | None = None,
+    clamp_min: float | None = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply complementary raw-Gamma and log-Gaussian perturbations.
+
+    ``strategy='mixture'`` assigns each selected patch to exactly one noise
+    family. ``strategy='sequential'`` applies raw-domain Gamma first and then
+    log-domain Gaussian to every selected patch. The caller controls the two
+    strengths explicitly, so reduced sequential ranges are recorded directly
+    in the run configuration.
+    """
+    if strategy == "mixture":
+        gamma_visible, gaussian_visible, gamma_fraction = (
+            split_hidden_regions_by_patch(
+                visible_mask,
+                patch,
+                gamma_probability,
+                generator=choice_generator,
+            )
+        )
+    elif strategy == "sequential":
+        gamma_visible = visible_mask
+        gaussian_visible = visible_mask
+        gamma_fraction = torch.ones(
+            (log_image.shape[0],),
+            device=log_image.device,
+            dtype=log_image.dtype,
+        )
+    else:
+        raise ValueError(
+            f"unsupported hybrid strategy {strategy!r}; "
+            "choose 'mixture' or 'sequential'"
+        )
+
+    gamma_corrupted, cvs = apply_local_gamma_noise(
+        log_image,
+        gamma_visible,
+        gamma_cv_min,
+        gamma_cv_max,
+        generator=gamma_generator,
+    )
+    corrupted, sigmas = apply_local_gaussian_noise(
+        gamma_corrupted,
+        gaussian_visible,
+        gaussian_sigma_min,
+        gaussian_sigma_max,
+        generator=gaussian_generator,
+        clamp_min=clamp_min,
+    )
+    return corrupted, cvs, sigmas, gamma_fraction
+
+
 def masked_charbonnier(
     prediction: torch.Tensor,
     target: torch.Tensor,
@@ -263,6 +397,8 @@ __all__ = [
     "apply_visible_mask",
     "apply_local_gaussian_noise",
     "apply_local_gamma_noise",
+    "apply_local_hybrid_noise",
     "masked_charbonnier",
     "MaskedFeaturePredictionLoss",
+    "split_hidden_regions_by_patch",
 ]

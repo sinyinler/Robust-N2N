@@ -49,12 +49,17 @@ class MaskedResumeTest(unittest.TestCase):
         val_loader = SimpleNamespace(generator=torch.Generator().manual_seed(10_189))
         mask_generator = torch.Generator().manual_seed(20_188)
         noise_generator = torch.Generator().manual_seed(40_188)
+        extra_generators = {
+            "hybrid_gaussian": torch.Generator().manual_seed(50_188),
+            "hybrid_choice": torch.Generator().manual_seed(60_188),
+        }
 
         state = capture_rng_state(
             train_loader,
             val_loader,
             mask_generator,
             noise_generator,
+            extra_generators,
         )
         expected = (
             random.random(),
@@ -64,6 +69,8 @@ class MaskedResumeTest(unittest.TestCase):
             float(torch.rand((), generator=val_loader.generator)),
             float(torch.rand((), generator=mask_generator)),
             float(torch.rand((), generator=noise_generator)),
+            float(torch.rand((), generator=extra_generators["hybrid_gaussian"])),
+            float(torch.rand((), generator=extra_generators["hybrid_choice"])),
         )
 
         restore_rng_state(
@@ -72,6 +79,7 @@ class MaskedResumeTest(unittest.TestCase):
             val_loader,
             mask_generator,
             noise_generator,
+            extra_generators,
         )
         actual = (
             random.random(),
@@ -81,6 +89,8 @@ class MaskedResumeTest(unittest.TestCase):
             float(torch.rand((), generator=val_loader.generator)),
             float(torch.rand((), generator=mask_generator)),
             float(torch.rand((), generator=noise_generator)),
+            float(torch.rand((), generator=extra_generators["hybrid_gaussian"])),
+            float(torch.rand((), generator=extra_generators["hybrid_choice"])),
         )
         self.assertEqual(actual, expected)
 

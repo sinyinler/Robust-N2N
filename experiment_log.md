@@ -529,3 +529,24 @@
 - 输出目录：`results/eval_curve/gamma_E100_b6_s187_level1_first500_reference/`；正式逐帧结果为
   `per_frame.csv`，曲线为 `psnr_curve.png` 与 `photometric_diagnostic_curve.png`，代表帧全图和
   192×192 中心局部放大为 `representative_frame_147/comparison_with_zoom.png`。
+
+## 2026-08-17 Level4 H4基线上的Gamma/Gaussian联合扰动消融
+
+- 目标与选择标准：用户明确本阶段只比较Level4数值，不用Level1泛化指标选择配置。现有seed42、
+  epoch100、scene0前500帧结果中，H4（Gaussian、region ratio=0.25、patch=8）同时取得最高
+  PSNR=`33.307 dB`和SSIM=`0.8697`，因此本轮以H4而非F1作为唯一基线。
+- 新增三组严格对照：J0只使用raw域Gamma；J1保持总扰动区域25%，在patch级以50%概率把已选
+  patch互斥分配给raw-Gamma或log-Gaussian；J2在同一已选patch先施加Gamma再施加Gaussian，
+  两种标准差型强度均乘`1/sqrt(2)`，避免直接叠加导致扰动能量翻倍。三组都固定patch=8、
+  feature weight=0.10、Encoder2+Encoder3、predictor ratio=1、EMA=0.996、feature warmup=10%、
+  RTV=0.01、batch=12、seed42及Level4 scenes 0--29，其余训练参数与H4一致。
+- 实现：`train_masked.py`新增`hybrid_mixture`和`hybrid_sequential`；Gamma、Gaussian与patch类型
+  选择使用相互独立的随机流并写入checkpoint，支持epoch边界严格恢复。联合扰动只进入训练期
+  Student辅助分支；正常N2N分支、EMA Teacher目标与推理网络不变。日志新增实际Gamma patch
+  比例、Gamma CV、Gaussian sigma及raw区域均值变化。
+- 自动流程：`scripts/run_level4_hybrid_ablation.sh`在两张GPU上完成J0/J1并行训练、J2后续训练、
+  三组Level4 scene0前500帧相对H4的配对评测，以及最终CSV/Markdown汇总；
+  `scripts/summarize_level4_hybrid.py`输出PSNR/SSIM/r、相对H4的ΔPSNR和逐帧胜出数。
+- 验证边界：本地只完成不读取实验数据的合成张量单元测试与前后向smoke；没有启动任何正式训练
+  或500帧推理。正式CUDA、数据读取、100 epoch训练和指标验证按用户要求全部在服务器执行，
+  结果尚待回填。

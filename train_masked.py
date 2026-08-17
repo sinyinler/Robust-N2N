@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Train N2N with region-based masked, Gaussian, or Gamma feature prediction.
+"""Train N2N with region-based masked, Gaussian, Gamma, or hybrid prediction.
 
 Normal branch:
     n1 -> student -> y1,                    L_n2n = Charb(y1, n2)
@@ -11,6 +11,9 @@ Gaussian branch:
 Gamma branch:
     log1p(raw * local Gamma factor) -> single-channel student -> F_noise,
     L_mask_feature on perturbed locations (the region map is not a model input)
+Hybrid branches:
+    patch mixture: selected patches receive either raw-Gamma or log-Gaussian;
+    sequential: selected patches receive raw-Gamma then log-Gaussian.
 Teacher branch (only when feature weight > 0):
     n2 -> EMA teacher -> F_target,           L_mask_feature on hidden locations
 
@@ -40,11 +43,22 @@ from losses.masked_prediction import (
     MaskedFeaturePredictionLoss,
     apply_local_gaussian_noise,
     apply_local_gamma_noise,
+    apply_local_hybrid_noise,
     apply_visible_mask,
     make_block_visible_mask,
     masked_charbonnier,
 )
 from utils.training_curves import update_training_curves
+
+
+SINGLE_CHANNEL_CORRUPTIONS = {
+    "gaussian",
+    "gamma",
+    "hybrid_mixture",
+    "hybrid_sequential",
+}
+GAMMA_CORRUPTIONS = {"gamma", "hybrid_mixture", "hybrid_sequential"}
+GAUSSIAN_CORRUPTIONS = {"gaussian", "hybrid_mixture", "hybrid_sequential"}
 
 
 def set_seed(seed: int) -> None:
@@ -199,8 +213,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="")
 
     # Region-based auxiliary objectives. The default keeps historical mask runs unchanged.
-    p.add_argument("--corruption_mode", choices=["mask", "gaussian", "gamma"], default="mask",
-                   help="mask=历史双通道硬遮挡；gaussian=log域局部加噪；gamma=raw域局部乘性噪声")
+    p.add_argument("--corruption_mode", choices=[
+        "mask", "gaussian", "gamma", "hybrid_mixture", "hybrid_sequential",
+    ], default="mask",
+                   help=("mask=历史双通道硬遮挡；gaussian=log域局部加噪；"
+                         "gamma=raw域局部乘性噪声；hybrid_mixture=patch级互斥混合；"
+                         "hybrid_sequential=同一区域Gamma后接Gaussian"))
     p.add_argument("--mask_ratio", type=float, default=0.25)
     p.add_argument("--mask_patch", type=int, default=16)
     p.add_argument("--mask_fill", choices=["zero", "mean"], default="zero")
@@ -232,6 +250,12 @@ def parse_args() -> argparse.Namespace:
                    help="Gamma 模式每张图乘性因子 CV 的采样下界")
     p.add_argument("--gamma_cv_max", type=float, default=0.075,
                    help="Gamma 模式每张图乘性因子 CV 的采样上界")
+    p.add_argument("--hybrid_gamma_probability", type=float, default=0.5,
+                   help="hybrid_mixture中每个已选patch使用Gamma的概率")
+    p.add_argument("--hybrid_gaussian_seed_offset", type=int, default=50_001,
+                   help="hybrid模式独立Gaussian随机流的seed offset")
+    p.add_argument("--hybrid_choice_seed_offset", type=int, default=60_001,
+                   help="hybrid_mixture中patch噪声类型随机流的seed offset")
     p.add_argument("--predictor_seed_offset", type=int, default=30_001,
                    help="feature predictor seed = seed + offset，且不推进全局 Torch RNG")
     p.add_argument("--grad_diag_every", type=int, default=0,
@@ -260,8 +284,14 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("ema_decay must be in [0,1)")
     if args.feature_warmup_frac < 0:
         raise ValueError("feature_warmup_frac must be non-negative")
-    if args.mask_seed_offset < 0 or args.noise_seed_offset < 0 or args.predictor_seed_offset < 0:
-        raise ValueError("mask/noise/predictor seed offsets must be non-negative")
+    if any(offset < 0 for offset in (
+        args.mask_seed_offset,
+        args.noise_seed_offset,
+        args.hybrid_gaussian_seed_offset,
+        args.hybrid_choice_seed_offset,
+        args.predictor_seed_offset,
+    )):
+        raise ValueError("all corruption/predictor seed offsets must be non-negative")
     if args.noise_sigma < 0:
         raise ValueError("noise_sigma must be non-negative")
     if (args.noise_sigma_min_scale < 0
@@ -269,15 +299,17 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("noise sigma scales must satisfy 0 <= min <= max")
     if args.gamma_cv_min <= 0 or args.gamma_cv_max < args.gamma_cv_min:
         raise ValueError("gamma CV range must satisfy 0 < min <= max")
-    if args.corruption_mode in {"gaussian", "gamma"} and args.w_mask_pixel > 0:
+    if args.corruption_mode in SINGLE_CHANNEL_CORRUPTIONS and args.w_mask_pixel > 0:
         raise ValueError("noise corruption modes do not use pixel inpainting; set --w_mask_pixel 0")
-    if args.corruption_mode in {"gaussian", "gamma"} and args.w_mask_feature <= 0:
+    if args.corruption_mode in SINGLE_CHANNEL_CORRUPTIONS and args.w_mask_feature <= 0:
         raise ValueError("noise corruption modes require --w_mask_feature > 0")
-    if (args.corruption_mode == "gaussian" and args.noise_sigma <= 0
+    if (args.corruption_mode in GAUSSIAN_CORRUPTIONS and args.noise_sigma <= 0
             and not args.noise_stats_json):
-        raise ValueError("gaussian mode requires --noise_sigma > 0 or --noise_stats_json")
-    if args.corruption_mode == "gamma" and args.intensity_transform != "log1p":
-        raise ValueError("gamma mode currently requires --intensity_transform log1p")
+        raise ValueError("Gaussian-containing modes require --noise_sigma > 0 or --noise_stats_json")
+    if args.corruption_mode in GAMMA_CORRUPTIONS and args.intensity_transform != "log1p":
+        raise ValueError("Gamma-containing modes currently require --intensity_transform log1p")
+    if not 0.0 <= args.hybrid_gamma_probability <= 1.0:
+        raise ValueError("hybrid_gamma_probability must be in [0,1]")
     if args.grad_diag_every < 0:
         raise ValueError("grad_diag_every must be non-negative")
     if args.grad_diag_every > 0 and not args.grad_diag_scales:
@@ -293,7 +325,7 @@ def parse_args() -> argparse.Namespace:
 
 def resolve_noise_sigma(args: argparse.Namespace) -> tuple[float, float, float]:
     """解析 Gaussian 模式在模型输入域使用的参考/最小/最大 sigma。"""
-    if args.corruption_mode != "gaussian":
+    if args.corruption_mode not in GAUSSIAN_CORRUPTIONS:
         return 0.0, 0.0, 0.0
 
     reference = float(args.noise_sigma)
@@ -327,8 +359,17 @@ RESUME_CRITICAL_ARGS = (
     "corruption_mode",
     "mask_ratio",
     "mask_patch",
+    "mask_seed_offset",
+    "noise_seed_offset",
+    "noise_sigma",
+    "noise_stats_json",
+    "noise_sigma_min_scale",
+    "noise_sigma_max_scale",
     "gamma_cv_min",
     "gamma_cv_max",
+    "hybrid_gamma_probability",
+    "hybrid_gaussian_seed_offset",
+    "hybrid_choice_seed_offset",
     "w_mask_pixel",
     "w_mask_feature",
     "mask_feature_scales",
@@ -388,6 +429,7 @@ def capture_rng_state(
     val_loader,
     mask_generator: torch.Generator,
     noise_generator: torch.Generator,
+    extra_generators: dict[str, torch.Generator] | None = None,
 ) -> dict:
     """保存 epoch 边界处的全部可控随机状态，供下一次严格续训。"""
     state = {
@@ -397,6 +439,11 @@ def capture_rng_state(
         "mask_generator": mask_generator.get_state(),
         "noise_generator": noise_generator.get_state(),
     }
+    if extra_generators:
+        state["extra_generators"] = {
+            name: generator.get_state()
+            for name, generator in extra_generators.items()
+        }
     if torch.cuda.is_available():
         state["torch_cuda"] = torch.cuda.get_rng_state_all()
     train_generator = getattr(train_loader, "generator", None)
@@ -415,6 +462,7 @@ def restore_rng_state(
     val_loader,
     mask_generator: torch.Generator,
     noise_generator: torch.Generator,
+    extra_generators: dict[str, torch.Generator] | None = None,
 ) -> None:
     """恢复 epoch 边界处的随机状态。"""
     random.setstate(state["python"])
@@ -424,6 +472,16 @@ def restore_rng_state(
         torch.cuda.set_rng_state_all(state["torch_cuda"])
     mask_generator.set_state(state["mask_generator"])
     noise_generator.set_state(state["noise_generator"])
+    if extra_generators:
+        saved_extra = state.get("extra_generators", {})
+        missing = sorted(set(extra_generators) - set(saved_extra))
+        if missing:
+            raise ValueError(
+                "checkpoint RNG state is missing hybrid generators: "
+                + ", ".join(missing)
+            )
+        for name, generator in extra_generators.items():
+            generator.set_state(saved_extra[name])
     train_generator = getattr(train_loader, "generator", None)
     if train_generator is not None and "train_loader_generator" in state:
         train_generator.set_state(state["train_loader_generator"])
@@ -466,7 +524,7 @@ def train(args: argparse.Namespace) -> None:
     # Gaussian/Gamma 模式恢复真正的单通道结构；随机区域只供扰动和 loss 使用，不喂给模型。
     student: nn.Module = (
         DenoiserWithFeats(input_channels=1)
-        if args.corruption_mode in {"gaussian", "gamma"}
+        if args.corruption_mode in SINGLE_CHANNEL_CORRUPTIONS
         else MaskedDenoiserWithFeats(image_channels=1)
     ).to(device)
     teacher: nn.Module | None = None
@@ -512,6 +570,21 @@ def train(args: argparse.Namespace) -> None:
     mask_generator.manual_seed(args.seed + args.mask_seed_offset)
     noise_generator = torch.Generator(device=device)
     noise_generator.manual_seed(args.seed + args.noise_seed_offset)
+    extra_noise_generators: dict[str, torch.Generator] = {}
+    hybrid_gaussian_generator: torch.Generator | None = None
+    hybrid_choice_generator: torch.Generator | None = None
+    if args.corruption_mode in {"hybrid_mixture", "hybrid_sequential"}:
+        hybrid_gaussian_generator = torch.Generator(device=device)
+        hybrid_gaussian_generator.manual_seed(
+            args.seed + args.hybrid_gaussian_seed_offset
+        )
+        extra_noise_generators["hybrid_gaussian"] = hybrid_gaussian_generator
+    if args.corruption_mode == "hybrid_mixture":
+        hybrid_choice_generator = torch.Generator(device=device)
+        hybrid_choice_generator.manual_seed(
+            args.seed + args.hybrid_choice_seed_offset
+        )
+        extra_noise_generators["hybrid_choice"] = hybrid_choice_generator
 
     history_path = save_dir / "history.jsonl"
     start_epoch = 1
@@ -561,6 +634,7 @@ def train(args: argparse.Namespace) -> None:
                 val_loader,
                 mask_generator,
                 noise_generator,
+                extra_noise_generators,
             )
             resume_mode = "exact"
         else:
@@ -570,6 +644,13 @@ def train(args: argparse.Namespace) -> None:
             position_onecycle_after_steps(scheduler, global_step)
             mask_generator.manual_seed(args.seed + args.mask_seed_offset + global_step)
             noise_generator.manual_seed(args.seed + args.noise_seed_offset + global_step)
+            for name, generator in extra_noise_generators.items():
+                offset = (
+                    args.hybrid_gaussian_seed_offset
+                    if name == "hybrid_gaussian"
+                    else args.hybrid_choice_seed_offset
+                )
+                generator.manual_seed(args.seed + offset + global_step)
             train_generator = getattr(train_loader, "generator", None)
             if train_generator is not None:
                 train_generator.manual_seed(args.seed + 10_001 + completed_epoch)
@@ -617,11 +698,23 @@ def train(args: argparse.Namespace) -> None:
             f"range=[{noise_sigma_min:.6g}, {noise_sigma_max:.6g}]; "
             "model input=image only"
         )
-    else:
+    elif args.corruption_mode == "gamma":
         print(
             f"[INFO] local Gamma factor(raw-domain) CV range="
             f"[{args.gamma_cv_min:.6g}, {args.gamma_cv_max:.6g}]; "
             "E[factor]=1; model input=image only"
+        )
+    else:
+        strategy = (
+            "patchwise 50/50-style mixture"
+            if args.corruption_mode == "hybrid_mixture"
+            else "same-patch Gamma then Gaussian"
+        )
+        print(
+            f"[INFO] hybrid corruption={strategy}; Gamma CV="
+            f"[{args.gamma_cv_min:.6g}, {args.gamma_cv_max:.6g}]; "
+            f"Gaussian sigma(log-domain)=[{noise_sigma_min:.6g}, {noise_sigma_max:.6g}]; "
+            f"gamma_probability={args.hybrid_gamma_probability:.6g}; model input=image only"
         )
     print(
         f"[INFO] loss = N2N + {args.w_mask_pixel}*mask_pixel + "
@@ -634,6 +727,8 @@ def train(args: argparse.Namespace) -> None:
         f"weight_decay={args.weight_decay} "
         f"mask_seed={args.seed + args.mask_seed_offset} "
         f"noise_seed={args.seed + args.noise_seed_offset} "
+        f"hybrid_gaussian_seed={args.seed + args.hybrid_gaussian_seed_offset} "
+        f"hybrid_choice_seed={args.seed + args.hybrid_choice_seed_offset} "
         f"predictor_seed={args.seed + args.predictor_seed_offset} "
         f"grad_diag_every={args.grad_diag_every} grad_diag_scales={args.grad_diag_scales}"
     )
@@ -663,6 +758,7 @@ def train(args: argparse.Namespace) -> None:
             actual_hidden = 0.0
             sampled_noise_sigma = 0.0
             sampled_gamma_cv = 0.0
+            hybrid_gamma_fraction = 0.0
             raw_hidden_mean_ratio = 1.0
             raw_hidden_mean_delta = 0.0
             if use_corruption:
@@ -683,7 +779,7 @@ def train(args: argparse.Namespace) -> None:
                         clamp_min=0.0,
                     )
                     sampled_noise_sigma = float(sampled_sigmas.mean())
-                else:
+                elif args.corruption_mode == "gamma":
                     corrupted_n1, sampled_cvs = apply_local_gamma_noise(
                         n1,
                         visible,
@@ -692,6 +788,35 @@ def train(args: argparse.Namespace) -> None:
                         generator=noise_generator,
                     )
                     sampled_gamma_cv = float(sampled_cvs.mean())
+                else:
+                    assert hybrid_gaussian_generator is not None
+                    strategy = (
+                        "mixture"
+                        if args.corruption_mode == "hybrid_mixture"
+                        else "sequential"
+                    )
+                    corrupted_n1, sampled_cvs, sampled_sigmas, gamma_fractions = (
+                        apply_local_hybrid_noise(
+                            n1,
+                            visible,
+                            args.mask_patch,
+                            args.hybrid_gamma_probability,
+                            args.gamma_cv_min,
+                            args.gamma_cv_max,
+                            noise_sigma_min,
+                            noise_sigma_max,
+                            strategy=strategy,
+                            gamma_generator=noise_generator,
+                            gaussian_generator=hybrid_gaussian_generator,
+                            choice_generator=hybrid_choice_generator,
+                            clamp_min=0.0,
+                        )
+                    )
+                    sampled_gamma_cv = float(sampled_cvs.mean())
+                    sampled_noise_sigma = float(sampled_sigmas.mean())
+                    hybrid_gamma_fraction = float(gamma_fractions.mean())
+
+                if args.corruption_mode in GAMMA_CORRUPTIONS:
                     with torch.no_grad():
                         hidden = 1.0 - visible
                         raw_before = torch.expm1(n1)
@@ -791,6 +916,7 @@ def train(args: argparse.Namespace) -> None:
                 "hidden": actual_hidden,
                 "noise_sigma": sampled_noise_sigma,
                 "gamma_cv": sampled_gamma_cv,
+                "hybrid_gamma_fraction": hybrid_gamma_fraction,
                 "raw_hidden_mean_ratio": raw_hidden_mean_ratio,
                 "raw_hidden_mean_delta": raw_hidden_mean_delta,
             }
@@ -816,6 +942,8 @@ def train(args: argparse.Namespace) -> None:
                     "mask": "Masked N2N with feature prediction",
                     "gaussian": "Local-Gaussian N2N with feature prediction",
                     "gamma": "Raw-domain local-Gamma N2N with feature prediction",
+                    "hybrid_mixture": "Patch-mixed Gamma/Gaussian feature N2N",
+                    "hybrid_sequential": "Sequential Gamma-Gaussian feature N2N",
                 }[args.corruption_mode]
                 update_training_curves(history_path, curve_title)
             except Exception as error:
@@ -834,10 +962,11 @@ def train(args: argparse.Namespace) -> None:
                 val_loader,
                 mask_generator,
                 noise_generator,
+                extra_noise_generators,
             ),
             "model_type": (
                 "noise_feature_single_channel"
-                if args.corruption_mode in {"gaussian", "gamma"}
+                if args.corruption_mode in SINGLE_CHANNEL_CORRUPTIONS
                 else "masked_feature_two_channel"
             ),
         }
