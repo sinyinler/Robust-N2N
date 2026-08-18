@@ -550,3 +550,21 @@
 - 验证边界：本地只完成不读取实验数据的合成张量单元测试与前后向smoke；没有启动任何正式训练
   或500帧推理。正式CUDA、数据读取、100 epoch训练和指标验证按用户要求全部在服务器执行，
   结果尚待回填。
+
+## 2026-08-18 Level4 最优单变量组合验证：K0/K1
+
+- 背景：seed42、epoch100、Level4 scene0前500帧的单变量结果中，W1（feature warmup=20%）取得
+  PSNR=`33.487 dB`、SSIM=`0.8705`；H0（feature weight=0.05）、H4（patch=8）、C0（Gaussian=0）和
+  E1（EMA=0.999）也分别提高了Level4 PSNR。本轮只检验这些设置能否在同一模型中组合，不能把各自增益直接相加。
+- K0：以W1为起点，仅把`feature weight 0.10 -> 0.05`和`patch 16 -> 8`；保留默认局部Gaussian
+  `0.25--0.75 sigma`、EMA=`0.996`、region ratio=`0.25`、Encoder2+Encoder3、RTV=`0.01`。
+- K1：在K0上仅把Gaussian强度改为0、EMA改为`0.999`；零强度Gaussian仍保留25%区域采样、predictor、
+  EMA teacher和区域feature loss，因此不等价于无feature的B1。
+- 公平协议：两组均使用Level4 scenes 0--29、seed42、100 epoch、batch12、crop512、AdamW
+  weight decay=`1e-4`、相同OneCycleLR和同一训练/验证划分；两张GPU各运行一组。推理均只加载单通道student，
+  不使用corruption、predictor、EMA teacher或feature loss。
+- 自动化：`scripts/run_level4_k0_k1.sh`负责噪声统计检查、双GPU并行训练、中断后精确续训、与现有W1在
+  Level4 scene0前500帧上的未校准配对评估；`scripts/summarize_level4_k0_k1.py`生成CSV、Markdown表格和三模型
+  PSNR曲线。正式实验只在服务器运行，结果完成后需补记指标和关键血管区域的视觉结论。
+- 验证边界：本地仅完成shell/Python静态检查、既有corruption/resume单元测试和合成CSV汇总测试；
+  没有读取正式数据，也没有启动训练或500帧推理。正式CUDA训练和评估全部在服务器执行，结果尚待回填。
