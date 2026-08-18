@@ -70,6 +70,34 @@ latest_epoch_checkpoint() {
     | tail -n 1
 }
 
+# 在长训练开始前确认W1，避免100 epoch结束后才发现基线路径有误。
+resolve_w1_checkpoint() {
+  if [[ -n "${W1_CHECKPOINT:-}" ]]; then
+    if [[ ! -f "$W1_CHECKPOINT" ]]; then
+      echo "[ERROR] W1_CHECKPOINT 不存在：$W1_CHECKPOINT" >&2
+      return 5
+    fi
+    printf '%s\n' "$W1_CHECKPOINT"
+    return 0
+  fi
+
+  local -a candidates=()
+  mapfile -t candidates < <(
+    find "$W1_PARENT" -mindepth 2 -maxdepth 2 -type f \
+      -path "*/W1*s${SEED}*/model_epoch_100.pth" | sort
+  )
+  if [[ "${#candidates[@]}" -ne 1 ]]; then
+    echo "[ERROR] 应当唯一找到 W1 seed${SEED} epoch100，实际为 ${#candidates[@]} 个：" >&2
+    printf '  %s\n' "${candidates[@]:-<none>}" >&2
+    echo "[ERROR] 可通过环境变量 W1_CHECKPOINT=/absolute/path/model_epoch_100.pth 明确指定。" >&2
+    return 5
+  fi
+  printf '%s\n' "${candidates[0]}"
+}
+
+W1_CHECKPOINT_RESOLVED="$(resolve_w1_checkpoint)"
+echo "[INFO] W1 baseline=$W1_CHECKPOINT_RESOLVED"
+
 train_one() {
   local gpu="$1"
   local tag="$2"
@@ -161,33 +189,6 @@ train_one "$GPU1" K1 "$K1_DIR" 0.0 0.0 0.999 &
 PID_K1=$!
 wait "$PID_K0"
 wait "$PID_K1"
-
-resolve_w1_checkpoint() {
-  if [[ -n "${W1_CHECKPOINT:-}" ]]; then
-    if [[ ! -f "$W1_CHECKPOINT" ]]; then
-      echo "[ERROR] W1_CHECKPOINT 不存在：$W1_CHECKPOINT" >&2
-      return 5
-    fi
-    printf '%s\n' "$W1_CHECKPOINT"
-    return 0
-  fi
-
-  local -a candidates=()
-  mapfile -t candidates < <(
-    find "$W1_PARENT" -mindepth 2 -maxdepth 2 -type f \
-      -path "*/W1*s${SEED}*/model_epoch_100.pth" | sort
-  )
-  if [[ "${#candidates[@]}" -ne 1 ]]; then
-    echo "[ERROR] 应当唯一找到 W1 seed${SEED} epoch100，实际为 ${#candidates[@]} 个：" >&2
-    printf '  %s\n' "${candidates[@]:-<none>}" >&2
-    echo "[ERROR] 可通过环境变量 W1_CHECKPOINT=/absolute/path/model_epoch_100.pth 明确指定。" >&2
-    return 5
-  fi
-  printf '%s\n' "${candidates[0]}"
-}
-
-W1_CHECKPOINT_RESOLVED="$(resolve_w1_checkpoint)"
-echo "[INFO] W1 baseline=$W1_CHECKPOINT_RESOLVED"
 
 eval_one() {
   local gpu="$1"
