@@ -128,3 +128,458 @@
   （单 1×1 卷积、无 predictor）。→ 尺度无关(∈[−1,1])，w_feat=0.1 生效；stop-grad 防塌。
 - 公平评测：改用 eval_ood_robust.py 在 5x5 level1 OOD 上比 N2N(lv234)，不再用 raw.npy 单图。
 - 结果：待 v7 训练回填。
+
+## 2026-07-15 Masked N2N 首轮失败与实验控制修正
+
+- 首轮配置（分支 `codex/masked-feature-prediction`，commit `337118a`）：level4 训练，3 epoch，
+  crop512/batch16，seed42，mask ratio=0.25、patch=16；A=(pixel0, feature0)，
+  B=(pixel1, feature0)，C=(pixel0, feature0.05)，D=(pixel1, feature0.05)。
+- ID 单场景 50 帧（PSNR/MSSIM）：A=32.519/0.863，B=31.972/0.859，
+  C=31.559/0.840，D=32.340/0.865。D 相对 A 为 −0.179 dB；只有 MSSIM +0.002。
+- OOD level1、39 场景、level4 前50帧均值伪GT（PSNR/SSIM）：A=22.465/0.6224，
+  B=21.272/0.6048，C=21.165/0.5063，D=22.153/0.6068。相对 A：
+  B=−1.193 dB/−0.0177，C=−1.301 dB/−0.1161，D=−0.312 dB/−0.0157。
+- 训练日志：epoch3 时 mask pixel raw loss≈0.270、主 N2N≈0.256，`w=1` 使辅助像素项与主任务等量；
+  C 的 feature 实际贡献仅 `0.009346×0.05≈0.000467`，却出现明显验证/OOD退化，不能用
+  “feature 权重过大”解释。
+- 定位到两个实验控制缺陷：① masked forward 同样更新 student 的 BatchNorm running statistics，
+  污染 all-visible 推理分布；② DataLoader shuffle/worker crop 和 mask 共用全局 RNG，predictor 初始化及
+  mask 随机数会改变不同 arm 的数据轨迹，seed42 并未形成严格配对。
+- 本次修正（本条记录所在提交）：masked forward 使用 batch statistics 和 BN affine 梯度，但暂停写入
+  running statistics；DataLoader/worker、mask 与 predictor 初始化使用相互隔离的 seeded RNG；日志新增
+  weighted RTV/pixel/feature；mask pixel pilot 权重降为0.1。旧 checkpoint 不与新结果混用，四个 arm 全部输出到
+  `results/checkpoints/maskfix_*`。
+- 修正后结果：待服务器重新训练并回填指标；必须同时检查
+  `results/eval_ood/maskfix_D_s42/compare/` 的全图与细血管局部放大，不能只凭 PSNR/SSIM 下结论。
+
+## 2026-07-15 Masked feature 微调阶段 0：epoch 曲线与梯度诊断
+
+- 目的：在改变 feature weight、mask ratio 或 projector 前，先用现有 A/C checkpoint 判断 3 epoch 是否训练充分，
+  并测量 N2N 与 masked feature 两项目标在 Encoder2/3 上的真实梯度强度和方向，避免只按 loss 标量猜权重。
+- 本条所在提交新增 `eval_masked_epochs.py`：统一评估 A-base/C-feature 的 seed=42/187/2413、epoch=1/2/3，
+  固定使用同一 level4 场景前 50 帧和同一 reference；输出逐帧 CSV、seed/epoch 汇总、跨 seed epoch 曲线、
+  paired bootstrap 95% CI，以及同窗宽全图/中心局部放大。ID test 曲线只作学习过程诊断，checkpoint 选择仍以
+  `history.jsonl` 的 validation loss 为先，避免用 test PSNR 直接选 epoch。
+- `train_masked.py` 新增可选 `--grad_diag_every` 和 `--grad_diag_scales`。诊断通过 `torch.autograd.grad`
+  临时读取梯度，不写入参数 `.grad`，记录到每次训练目录的 `grad_diagnostics.jsonl`；默认关闭，后续微调命令
+  显式使用 `--grad_diag_every 100 --grad_diag_scales encoder2 encoder3`。新增
+  `scripts/summarize_grad_diagnostics.py`，默认排除 warmup（`ramp<0.99`），汇总 feature/N2N 梯度范数比、
+  梯度余弦、负余弦比例和强冲突（默认 cosine<-0.2）比例。
+- 第一阶段服务器评估命令：
+
+  ```bash
+  python eval_masked_epochs.py \
+    --checkpoint_root results/checkpoints \
+    --a_dir_template 'maskfix_A_base_s{seed}' \
+    --c_dir_template 'maskfix_C_feature_s{seed}' \
+    --seeds 42 187 2413 \
+    --epochs 1 2 3 \
+    --scene_dir /mnt2/songyd/5x5/5x5x4/0/npy \
+    --reference /home/songyd/Projects/Robust-N2N/reference.npy \
+    --n_frames 50 \
+    --max_vis_frames 1 \
+    --device cuda \
+    --out_dir results/eval_id/maskfix_epoch_sweep
+  ```
+
+- 结果：待服务器执行后回填 `results/eval_id/maskfix_epoch_sweep/summary.json`、`epoch_summary.csv` 和
+  `compare/` 的视觉结论；确认 epoch 3 是否仍改善后，才进入第一个单变量微调。
+
+## 2026-07-15 Masked feature 微调阶段 1：seed42、5 epoch、加入原始 N2N
+
+- 阶段 0 结果：A/C 三 seed 在 epoch3 的 ID 配对增益为 `+0.226±0.023 dB`，三个 seed 分别
+  `+0.214/+0.252/+0.212 dB`，总胜出 `127/150` 帧；跨 seed MSSIM `+0.00130`、Pearson r
+  `+0.00251`。A/C 六条 validation 曲线从 epoch2 到 epoch3 全部继续下降，因此先验证 5 epoch，
+  暂不调 feature weight，也不加 projector。
+- 本轮只跑 seed42，但同时从头训练三组：
+  1. Original：`train_n2n.py` 单通道网络、原始 N2N loss/optimizer 配方，`weight_decay=0.01`；
+  2. A-base：双通道 all-visible 公平基线，`weight_decay=1e-4`；
+  3. C-feature：A-base + masked feature prediction，`weight_decay=1e-4`。
+- 解释边界：`C-A` 隔离 feature-loss；`C-Original` 回答相对原始系统的实际净提升；`A-Original`
+  量化双通道/trainer/weight-decay 等非 feature 因素，三者不可互相替代。三组都固定 level4、crop512、
+  batch16、seed42、同一独立 DataLoader RNG 和 5 epoch OneCycle；5-epoch OneCycle 会重定义整个学习率轨迹，
+  因此必须从头训练，不能把旧 3-epoch checkpoint 直接续两轮。
+- 实现：`train_n2n.py` 新增显式 `--weight_decay`、`--deterministic_loader_rng` 和 `history.jsonl`；
+  `train_masked.py` 将既有 `1e-4` 暴露为参数但默认行为不变；`eval_masked_epochs.py` 新增可选
+  `--original_dir_template`，同帧输出 Original/A/C 指标、C-A、C-Original、A-Original、bootstrap CI
+  及五列同窗宽局部放大图。结果待服务器训练后回填。
+
+## 2026-07-16 Masked feature 微调阶段 2：100 epoch 收敛曲线与 feature weight=0.10
+
+- 多 seed 5-epoch 结果表明：`w_mask_feature=0.05` 在 epoch4 相对 A-base 的 level1 OOD PSNR
+  三个 seed 均提升且逐场景 bootstrap CI 均大于零；到 epoch5 后独立增益减弱。下一项保持数据、网络、
+  optimizer 和其他 loss 不变，只把 feature weight 从 0.05 调到 0.10，并与原始单通道 N2N 同时从头
+  训练 100 epoch，观察辅助约束能否在训练后期维持作用。
+- 新增 `utils/training_curves.py`。两个训练入口默认每个 epoch 从 `history.jsonl` 自动刷新
+  `loss_curve.png` 和 `loss_history.csv`。原始 N2N 画可直接比较的 train/validation loss；masked
+  模型同时画 train total、validation reconstruction、可比的 train reconstruction（N2N+RTV）以及
+  weighted feature/RTV 等分量，避免把含辅助项的 train total 与不含辅助项的 validation 误当成同一目标。
+- 两个100-epoch进程分别固定到两张24GB GPU，并显式关闭 DataParallel；batch size 均为16。100-epoch
+  OneCycleLR 会重定义完整学习率轨迹，因此两组都必须从头训练，不能续接5-epoch checkpoint。
+- 新增 `scripts/run_e100_original_feature010.sh`，默认 seed42，分别绑定物理 GPU0/GPU1 并行启动；
+  独立保存 stdout 日志、PID、checkpoint 和 loss 曲线。脚本拒绝复用已有输出目录，避免重复运行时把
+  不同训练轨迹追加进同一 `history.jsonl`。这两组只能衡量 C-system 相对 Original 的净变化；若要严格
+  隔离 `0.10-0.05` 或 feature 本身，仍需同调度的 `w=0.05` 或 A-base 对照。
+- 首次双 GPU 启动时 feature 组 batch16 在 GPU1 OOM。100 epoch 与 feature loss 的标量权重不改变单步
+  激活规模，因此先检查 GPU1 占用，并将 feature 默认 batch 降为12；原始 N2N 保持16。启动脚本新增
+  `N2N_BATCH`/`FEATURE_BATCH` 环境变量，checkpoint 和日志目录显式包含 batch，避免混淆失败的 batch16
+  轨迹与重新从头训练的 batch12 轨迹。
+- 公平性修正：Original 和 feature 两组必须使用相同 batch。最终协议将两组默认值都设为12，并废弃已启动
+  的 Original batch16 轨迹；两组从 epoch1 重新训练。原因不仅是单批梯度统计不同，batch 还会改变每个
+  epoch 的 optimizer step 数和100-epoch OneCycleLR 的完整轨迹，不能从 batch16 checkpoint 续训。
+
+## 2026-07-17 局部 Gaussian feature：避免长期硬掩码产生假血管
+
+- 现象与假设：100-epoch hard-mask feature 模型在背景产生微小假血管。16×16 block 完全置零会把辅助任务
+  变成局部 inpainting；长期优化可能过度学习“沿上下文补出连续血管”。本轮只替换辅助分支的 corruption，
+  验证保留像素证据能否降低这种结构幻觉。
+- 实现：`train_masked.py` 新增向后兼容的 `--corruption_mode gaussian`。仍随机选取25%的16×16区域，但在
+  `log1p` 域只对选中区域加入独立 Gaussian noise，不再置零；区域图只负责扰动和圈定 encoder2/encoder3
+  feature loss，**不作为网络输入**。Gaussian 模式使用 `DenoiserWithFeats(input_channels=1)`，projector/
+  predictor 和 EMA teacher 仍只存在于训练期，checkpoint 可按原始单通道 N2N 结构推理。
+- 噪声标定：新增训练参数可读取 `scripts/measure_noise.py` 的 `recommended_sigma`；每张图独立采样
+  `sigma ~ Uniform(0.25*sigma_real, 0.75*sigma_real)`，并使用独立 noise RNG，避免改变 region/DataLoader
+  随机轨迹。辅助 forward 继续冻结 BN running statistics，只允许正常 N2N 分支维护推理统计。
+- 实验控制：新增 `scripts/run_e100_noise_feature010.sh`，固定 level4、crop512、batch12、seed42、100 epoch、
+  `w_feature=0.10`、weight decay=1e-4，与既有 Mask-C 配方一致；Original/Mask-C 的既有 E100 结果可以复用。
+  对比必须同时报告 best-validation 与 epoch100 的 ID/OOD PSNR、SSIM，以及假血管背景区域局部放大和
+  difference map。结果待服务器训练后回填，不能仅凭 loss 或平均 PSNR 判断是否消除假血管。
+# 2026-07-18 SIDD-Small sRGB 监督基线与公开 Validation 管线
+
+- 目的：在不下载 SIDD-Full 的前提下，用本地完整的 `SIDD_Small_sRGB_Only` 建立真实噪声
+  `NOISY -> GT` 监督基线，并为公开 SIDD Validation blocks 建立可复查的外部评测。
+- 数据核验：160 个完整 RGB pair、320 张 PNG、NOISY/GT 尺寸不匹配为 0。按 scene 隔离：
+  train=`001-006,009,010`（120 对），validation=`007`（20 对），internal test=`008`（20 对）。
+- 实现：新增独立 `data/sidd_dataset.py`、`models/sidd_rgb_denoiser.py`、`train_sidd.py`、
+  `eval_sidd.py`、`eval_sidd_blocks.py` 和 `configs/sidd_supervised.json`；原单通道 BFI/N2N
+  路径不改。RGB 网络不压灰度，输入/输出均为 3 通道，共 67,614 个参数；训练域为 `[0,1]`
+  sRGB，首轮只用 Charbonnier，RTV/feature loss 均为 0。
+- 默认训练配置：crop256；一次大图解码取 4 个同步增强 crop；image batch=4、有效 patch batch=16；
+  AdamW，lr=`1e-3 -> 1e-5` cosine，weight decay=`1e-4`，20 epoch，seed42，AMP。
+- Validation 下载：York 官方主机连接超时，公开 Google Drive `test.zip` 触发下载配额；改用
+  Hugging Face `talib-sid/sidd-val` 中由原 MAT 无损导出的 1280 对 PNG LMDB，按原 key 顺序
+  重建两个标准 MAT。两者变量均为 `uint8 (40,32,256,256,3)`。中转 LMDB 验证后已删除
+  （315,785,044 bytes），只保留：
+  - `D:/Desktop/数据集/SIDD/Validation/ValidationNoisyBlocksSrgb.mat`：229,019,520 bytes，
+    local SHA256 `5A9F84EA873A3B347103740CDE7DCEA9BF3F1012FB75828A464DAB8E868AA02C`；
+  - `D:/Desktop/数据集/SIDD/Validation/ValidationGtBlocksSrgb.mat`：229,831,366 bytes，
+    local SHA256 `D208846192DCD219B1DD17A46CC2CF931449A26CD17019E48DCE79B1CA67914F`。
+  MAT 容器由 SciPy 重建，压缩字节数/哈希不等同于官方 MATLAB 容器，但数组来自无损 PNG blocks。
+- 校验：PyTorch 2.8/CUDA 12.6/RTX 3060 上数据读取、一次 forward/backward、checkpoint 严格加载和
+  700x900 tiled inference 均通过；输出 shape 正确且无 NaN/Inf。两 step CLI smoke 的 train/val
+  Charbonnier 为 `0.25408/0.29063`，只用于程序校验，不作为实验结果。
+- 公开 Validation noisy baseline（1280 blocks）：RGB PSNR=`23.66238 dB`，SSIM=`0.333469`。
+  SSIM 明确采用 11x11 Gaussian、sigma=1.5、`data_range=1`；逐块 CSV、summary 和 5 张视觉图位于
+  `results/sidd/validation_noisy_baseline/`。这一定义用于本地一致对照；最终官方 benchmark 仍以
+  Kaggle 返回数值为准。
+- 当前结论：代码、数据、指标和可视化链路已打通；尚未把 2-step smoke 冒充去噪结果。下一步是
+  从头运行 20 epoch baseline，再用 `best.pt` 同时评估 scene008 完整图和公开 Validation blocks。
+
+## 2026-07-18 SIDD 监督基线训练完成与双重评估
+
+- 训练完成：20 epoch、4800 optimizer steps；train Charbonnier 从 `0.140206` 降到 `0.013278`，validation
+  从 `0.069786` 降到 `0.009648`。最佳 checkpoint 为 epoch 19，validation=`0.009596`；epoch 20 仅轻微回升，
+  没有明显过拟合。checkpoint 与曲线位于 `results/sidd/supervised_charbonnier_s42/`。
+- 公开 SIDD Validation blocks（1280 blocks，和 noisy baseline 使用完全相同的本地 RGB 指标定义）：
+  noisy=`23.66238 dB / 0.333469 SSIM`，模型=`35.17941 dB / 0.845399 SSIM`，增益
+  `+11.51703 dB / +0.511930`；paired bootstrap 95% CI 分别为 `[11.38497, 11.64759] dB` 和
+  `[0.505619, 0.518158]`。PSNR 胜出 `1280/1280` blocks，SSIM 胜出 `1279/1280` blocks。
+  结果位于 `results/sidd/validation_trained/`。这属于公开 Validation 本地评估，不是隐藏 GT 的官方 benchmark 分数。
+- scene-disjoint internal test（scene 008，20 张完整高分辨率图，tile 512/overlap 64）：
+  noisy=`26.46744 dB / 0.555477 SSIM`，模型=`31.83252 dB / 0.786656 SSIM`，增益
+  `+5.36508 dB / +0.231179`；instance bootstrap 95% CI 分别为 `[3.45692, 7.13857] dB` 和
+  `[0.143378, 0.314838]`。PSNR 胜出 `18/20`，SSIM 胜出 `16/20`。这些实例共享同一 held-out scene 内容，
+  因而 CI 只能作为内部诊断，不能当成跨场景泛化置信区间。结果位于 `results/sidd/internal_test_scene008/`。
+- 失败样本集中在已经很干净的 ISO 100 输入：`0180_008_GP_00100_00100_5500_N` 为
+  `31.5265 -> 27.7523 dB`、`0.8788 -> 0.7072 SSIM`；`0188_008_IP_00100_00100_3200_N` 为
+  `31.9034 -> 29.2139 dB`、`0.8784 -> 0.7969 SSIM`。当前非 noise-aware 模型会对低噪声图继续强去噪，
+  导致布料细纹理被抹除。
+- 视觉结论：高噪声区域的彩色噪声显著减少、未观察到 tile 拼接缝或明显颜色漂移；但细密布料纹理存在
+  可见过度平滑。基线已证明真实 RGB noisy-to-GT 监督链路有效，下一阶段的主要问题是低噪声自适应与保纹理，
+  不是简单增加 epoch。
+
+## 2026-07-18 SIDD Gaussian feature-loss 与 RTV 消融
+
+- 目的：在完全相同的 SIDD-Small scene-disjoint 划分、网络、优化器、20 epoch 和 seed42 下，从头训练两个单变量递进实验：
+  1. `NOISY -> GT + Gaussian masked feature prediction`，`rtv_weight=0`；
+  2. 在 1 的基础上增加 `rtv_weight=1e-4`。
+- feature 分支只在训练期存在：随机选择 25% 的 16x16 区域，在该区域加入 `sigma ~ U(0.0072677, 0.0218030)` 的 Gaussian noise；
+  student predictor 对齐 GT 的 EMA teacher encoder2/encoder3 特征，`feature_weight=0.10`。推理网络和基线完全同构，仍为 67,614 参数，
+  不增加推理参数或额外噪声。噪声与 feature-loss 绑定，不作用于主监督输入。
+- 训练健康：两组均完成 20 epoch/4,800 steps，无 NaN、AMP skip 或发散。feature-only 最佳为 epoch19，scene007 validation
+  Charbonnier=`0.00941634`；feature+RTV 最佳为 epoch19，`0.00953235`；纯监督基线为 epoch19，`0.00959633`。
+- 公开 SIDD Validation blocks（1280 blocks，RGB PSNR/SSIM）：
+  - baseline：`35.17941 / 0.845399`；
+  - feature-only：`35.29428 / 0.847705`，相对 baseline `+0.11486 dB / +0.002306`；配对 bootstrap 95% CI
+    `[0.09225,0.13700] dB / [0.001768,0.002826]`；胜出 `848/1280 PSNR`、`957/1280 SSIM`；
+  - feature+RTV：`35.36451 / 0.853399`，相对 baseline `+0.18510 dB / +0.008000`；相对 feature-only
+    `+0.07024 dB / +0.005694`，增量 95% CI `[0.04956,0.09133] dB / [0.005295,0.006106]`，
+    胜出 `861/1280 PSNR`、`1121/1280 SSIM`。
+- scene008 完整图 internal test（20 instances，tile512/overlap64）：
+  - baseline：`31.83252 / 0.786656`；
+  - feature-only：`31.87815 / 0.787629`，相对 baseline `+0.04563 dB / +0.000973`；PSNR CI 不跨 0，SSIM CI 跨 0；
+  - feature+RTV：`31.92025 / 0.790455`，相对 baseline `+0.08773 dB / +0.003798`，95% CI
+    `[0.03083,0.14546] dB / [0.000522,0.007335]`；相对 feature-only `+0.04210 dB / +0.002825`，
+    95% CI `[0.01363,0.07133] dB / [0.001595,0.004079]`，20 张中两项均胜出 15 张。
+- 视觉复核：高噪声 `0170` 中 feature 和 RTV 都降低彩噪，RTV 未观察到新增假结构或 tile 接缝；但三个模型都明显抹平 GT 的织物网格。
+  低 ISO `0180/0188` 仍是主要失败点：输入约 `31.53/31.90 dB`，feature+RTV 仅 `27.90/29.17 dB`，说明当前模型仍会对已较干净图像过度去噪。
+  RTV 相对 feature-only 在这些样本没有一致恶化，但也没有解决 noise-aware 问题。
+- 决策：`feature+RTV(1e-4)` 是当前三组中量化指标最好的配置，可以作为下一阶段候选；feature-loss 的独立收益成立，低权重 RTV 也有额外收益。
+  结论仍限于单 seed、公开 Validation 和单个 held-out scene，不能等同于隐藏 GT 的官方 benchmark；在扩大模型/训练轮数前，优先解决低 ISO 自适应与纹理保持。
+- 产物：三组配对统计、CI、曲线和高/低噪声五列视觉图位于 `results/sidd/ablation_comparison/`；最佳 checkpoint 分别位于
+  `results/sidd/supervised_feature_gaussian_s42/best.pt` 和 `results/sidd/supervised_feature_gaussian_rtv1e4_s42/best.pt`。
+
+## 2026-07-18 SIDD-Medium sRGB 下载、校验与解压
+
+- 目的：把训练数据从 SIDD-Small 的每个 scene instance 一对图扩展到论文常用的 SIDD-Medium sRGB（每个 scene instance 两对图），
+  同时区分 SIDD-Medium 与不适合本机磁盘容量的 SIDD-Full。
+- 官方来源：`http://130.63.97.225/share/SIDD_Medium_Srgb.zip`；官网标称约 12 GB，实际压缩包
+  `13,234,744,070 bytes = 12.326 GiB`。下载到 `E:/SIDD/SIDD_Medium_Srgb.zip`，解压目录为
+  `E:/SIDD/SIDD_Medium_Srgb/`。
+- 下载过程：官方单连接续传仅约 20--45 KiB/s，改用官网同一 URL 的 aria2 16 段 Range 续传，平均约 3.7 MiB/s。
+  aria2 1.37.0 Windows 64-bit 工具来自官方 GitHub release，工具压缩包 SHA256
+  `67D015301EEF0B612191212D564C5BB0A14B5B9C4796B76454276A4D28D9B288`。
+- 官方完整性校验全部通过：MD5=`F95B4BC9EC1DD3FE4EBD61AEACAD3991`；
+  SHA1=`B0F895258112DB896D6ADE0A8DDAFC8CFC9BD54D`。解压后为 160 个 scene instance、320 对 noisy/GT、
+  640 张 RGB PNG；逐对尺寸不匹配为 0，解压文件总量约 12.325 GiB。
+- SIDD-Full 容量核算：官网 Full 清单中的 320 个 sRGB 压缩分卷（160 scene instance × noisy/GT）Content-Length
+  合计 `986,172,587,651 bytes = 918.445 GiB`，还不含 Raw-RGB 和 metadata；E 盘下载前只有约 245.4 GiB 空闲，
+  因此不能在该盘保存 SIDD-Full。对标准 sRGB 监督训练，应使用 SIDD-Medium，而不是全量采集帧。
+- 新增可复用脚本：`scripts/download_sidd_medium.ps1` 支持断点续传和多连接；
+  `scripts/verify_extract_sidd_medium.ps1` 强制检查字节数、MD5、SHA1、解压结果和 320/320 图像计数。
+- 当前边界：数据已准备好，但现有 `data/sidd_dataset.py` 仍按 SIDD-Small 文件名只读取 `NOISY/GT_SRGB_010.PNG`；
+  Medium 文件还带 scene-instance 前缀并包含 `010/011`。正式训练前必须先扩展 pair discovery，并明确是用全部 320 对训练后只在公开
+  Validation/Benchmark 评估，还是继续保留 scene-disjoint internal test；本次仅完成下载与数据完整性验证，未擅自启动新训练。
+
+## 2026-07-18 SIDD-Medium scene-disjoint feature/RTV 重跑
+
+- 用户要求：数据下载后按上一轮顺序重跑，先 Gaussian feature-loss、RTV=0，再在完全相同配置上增加 `rtv_weight=1e-4`，
+  两组结束后自动评估公开 Validation blocks 和 scene008 完整图。
+- 对比协议：为了和 SIDD-Small 结果保持严格可比并避免 test leakage，继续按 scene 划分：train=`001-006,009,010`、
+  val=`007`、test=`008`。Medium 使每个 scene instance 从 1 对变为 2 对，因此 train/val/test 从 `120/20/20`
+  增加到 `240/40/40`；crop256、每 pair repeats=8、有效 batch16、20 epoch、seed42 及其余优化参数不变。
+- 数据适配：`data/sidd_dataset.py` 现在同时兼容 Small 的 `NOISY_SRGB_010.PNG` 和 Medium 带 scene-instance 前缀的
+  `*_NOISY_SRGB_010/011.PNG`，并用对应文件名自动寻找 GT；Small/Medium 发现数量分别回归验证为 160/320。
+- Medium 噪声重标定：240 个 train pair 的固定中心 256 crop 上，noisy-GT residual robust MAD sigma 中位数为
+  `0.0348847583`，因此 feature corruption 使用 `sigma ~ U(0.0087211896, 0.0261635687)`。
+- 两组各 2 optimizer-step smoke 通过：train_pairs=240、val_pairs=40、模型参数 67,614，forward/backward、EMA、
+  Gaussian feature 和 float32 RTV 均无 NaN/Inf 或 AMP skip。
+- 训练完成：两组均为 20 epoch / 9,600 optimizer steps，无 NaN、OOM 或 AMP skip。feature-only 最佳为 epoch19，
+  scene007 validation Charbonnier=`0.00857847`；feature+RTV 最佳为 epoch20，`0.00855096`。训练曲线后期基本重合，
+  因而不能仅凭 validation loss 判断 RTV。
+- 公开 Validation blocks（1,280 blocks，统一 RGB PSNR/SSIM 定义）：
+  - Medium feature-only：`36.33134 dB / 0.873008`；相对 Small feature-only 的
+    `35.29428 / 0.847705` 为 `+1.03707 dB / +0.025303`。逐 block 配对 bootstrap 95% CI 为
+    `[1.00337,1.07077] dB / [0.023802,0.026836]`，胜出 `1230/1280` blocks。
+  - Medium feature+RTV：`36.36978 dB / 0.876640`；相对 Small feature+RTV 的
+    `35.36451 / 0.853399` 为 `+1.00527 dB / +0.023242`。
+  - 在 Medium 内部，RTV 相对 feature-only 为 `+0.03843 dB / +0.003632`；95% CI
+    `[0.01936,0.05729] dB / [0.003287,0.003983]`，说明它在公开 blocks 上有小而稳定的收益。
+- scene008 完整图 internal test：feature-only 在 40 个 capture 上为 `32.37332 dB / 0.797499`，
+  feature+RTV 为 `32.33556 dB / 0.795715`。逐图配对后 RTV 变化为
+  `-0.03776 dB / -0.001784`，95% CI `[-0.07158,-0.00582] dB / [-0.003103,-0.000503]`，
+  仅胜出 `15/40 PSNR` 和 `14/40 SSIM`。因此 RTV 在完整场景上的下降不是由 010/011 数量不一致造成的。
+- Small 与 Medium 的严格同图比较只使用 capture010（20 对；noisy/GT 与 Small 对应图一致）：Medium feature-only
+  相对 Small feature-only 为 `+0.51691 dB`，95% CI `[0.20975,0.84541]`，胜出 `16/20`；SSIM
+  为 `+0.010982`，但 CI `[-0.000797,0.022504]` 跨 0。额外训练 pair 对 PSNR 的收益成立。
+- 失败案例和视觉复核：两种 Medium 模型都在 ISO100 的 `0180` 和 `0188` 两个 instance（010/011 共 4 张）
+  上低于 noisy 输入。feature-only 的 PSNR 分别下降约 `3.52/3.54 dB` 与 `1.34/1.45 dB`；RTV 进一步恶化为
+  `3.68/3.70 dB` 与 `1.68/1.79 dB`。高噪声 `0170` 的彩噪被明显压制且无 tile 接缝，但所有输出都比 GT
+  更平滑；低噪声样本的织物网格尤其明显，RTV 略加剧细节抹除。
+- 决策：扩大到 Medium 是明确有效的，当前应保留 **Medium feature-only** 作为整图默认模型；RTV=1e-4
+  只适合把公开 blocks PSNR/SSIM 作为唯一目标时使用，不能宣称对完整图普遍改善。下一轮优先做噪声强度门控、
+  identity/residual 保护或低 ISO 采样加权，而不是继续加大 RTV。
+- 产物：配对统计、失败样本、损失曲线和三张六列视觉图位于
+  `results/sidd/medium_ablation_comparison/`；最佳 checkpoint 位于
+  `results/sidd/medium_scene_split_feature_gaussian_s42/best.pt` 和
+  `results/sidd/medium_scene_split_feature_gaussian_rtv1e4_s42/best.pt`。
+
+## 2026-07-23 Reference 仿射光度漂移诊断
+
+- 目的：针对 5x5 长训练实验中“PSNR 大幅下降但 Pearson r 下降较小、部分图像出现整体亮度偏移”的现象，
+  区分全局亮度/对比度漂移与真实结构退化。
+- 新增可选评估诊断：对每张模型输出和 reference 的公共中心区域，以最小二乘拟合
+  `reference ≈ a * output + b`，再报告原始及仿射校正后的 PSNR/MSSIM/r、`a`、`b`、
+  `output/reference` 均值比和标准差比。校正值不裁剪，以保持两参数最小二乘诊断的定义。
+- 边界：`a,b` 的拟合直接使用 reference，因此校正后的指标只能用于定位误差来源，不能作为正式 benchmark
+  结果、可部署推理结果或论文主表指标；正式结果仍是未校正的原始模型输出。
+- 接口：`eval_curve.py` 新增 `--photometric_diagnostic 1`；逐帧字段追加到 `per_frame.csv`，
+  汇总写入 `photometric_diagnostic_summary.json`，校正前后 PSNR 与亮度/对比度比值曲线写入
+  `photometric_diagnostic_curve.png`。不开启开关时保持原评估输出和 `run_curve` 三数组返回接口。
+- 验证：3 个 NumPy 单元测试通过，包括已知映射 `reference=1.75*output-12.5` 的参数精确恢复、
+  不同尺寸公共中心裁剪以及常量输出的退化解；评估脚本与新增模块均通过语法检查。
+- 当前状态：本地没有服务器 checkpoint 和 `/mnt2/songyd/5x5` 数据，尚未记录 seed187 的实际
+  `a,b` 与校正增益；需要在训练服务器上重新推理 F1 与 B1/B0 后再据实判断。
+
+## 2026-07-26 raw 域局部 Gamma feature：seed187 亮度漂移压力测试
+
+- 动机：现有 feature arm 在 `log1p` 后加入 Gaussian noise，并将负值截断到 0；暗区截断会引入正偏，
+  而 seed187 是既有实验中亮度漂移最严重的随机种子。本轮按用户确认只把辅助 corruption 替换为 raw 域
+  Gamma，主 N2N、feature loss、RTV、区域采样、优化器和 seed 控制均保持不变。
+- 实现（commit `8371147`）：对模型输入先用 `expm1` 回到 raw 域，只在随机 25% 的 16×16 区域乘
+  `factor ~ Gamma(k, rate=k)`，其中每张图 `CV ~ U(0.025,0.075)`、`k=1/CV²`，再以 `log1p`
+  返回模型域。因 `E[factor]=1`，raw 域亮度在期望上不变；Gamma 路径不调用 Gaussian，也不执行
+  `clamp_min(0)`。旧 Gaussian 路径仅为历史结果可复现而保留。
+- 配置：seed=`187`，crop=`512`，本地 GPU=`RTX 3060 12GB`，batch=`8`，`w_feature=0.10`，
+  `rtv_weight=0.01`，weight decay=`1e-4`，feature scales=`encoder2/encoder3`，EMA=`0.996`；
+  其余正式 E100 参数与 `run_e100_noise_feature010.sh` 一致。本地正式入口为
+  `scripts/run_local_e100_gamma_feature010.ps1`，启动前强制核验期望场景数及每个变长序列的
+  `0.npy..(N-1).npy` 连续性。
+- 验证：
+  - 5 个单元测试全部通过；Gamma seed/RNG 可复现、未选区域逐元素保持不变，大样本 raw 均值比在
+    `1±1e-3` 内。原 Gaussian smoke 回归通过。
+  - CUDA feature smoke：hidden=`0.25`、平均 CV=`0.0555`、扰动区域 raw 均值比=`1.001354`；
+    backward、EMA 和单通道 N2N checkpoint 兼容检查通过。
+  - 512×512 完整两步显存探测包含 AdamW state 和首步 encoder2/encoder3 梯度诊断：
+    batch8 peak allocated=`8.027 GiB`、peak reserved=`8.793 GiB`，因此本地固定 batch8。
+  - scene0 真实数据两-batch pilot 完成，无 NaN/OOM；平均 CV=`0.05331`、hidden=`0.25`、
+    扰动区域 raw 均值比=`1.00005`、raw 均值差=`0.00098`。pilot checkpoint 与诊断位于
+    `results/smoke_gamma_seed187_b8_v2/`。
+- 边界与下一步：pilot 仅验证实现、亮度统计与显存，不代表去噪效果；没有据此报告 PSNR/SSIM 或视觉结论。
+  Level4 随后核验为 39 个变长 scene、19,760 帧，全部带 meta 且帧编号连续，随机抽取 20 个 NPY
+  均可读取；据此启动 seed187 E100。完成后必须同时比较未校正 PSNR/SSIM/r、raw 平均亮度比、
+  仿射诊断，以及全图/细血管/背景假血管局部放大图。
+- 首次正式启动在完成数据加载、报告 `2446 batches/epoch` 后，被 Windows PowerShell 5 将 tqdm 的正常
+  stderr 误包装为 `NativeCommandError` 而终止，尚未进入 optimizer step；该失败目录保留并改名标记。
+  启动器随后在调用 Python 期间局部使用 `ErrorActionPreference=Continue`，仍以原生 exit code 判定真正失败。
+- 修正启动器后 batch8 正常进入训练，但完整进程实测占用 `12036/12288 MiB`、仅余 `78 MiB`；为避免
+  桌面进程显存波动导致长跑随机 OOM，在 epoch1 第 19 step 主动停止，未产生 epoch checkpoint。
+- 正式长跑改为唯一允许变化的显存参数 batch6，其余配置与 seed187 均不变。启动 commit=`d035f38`，
+  `3261 batches/epoch`；跨过 step100/200 的 encoder2/encoder3 梯度诊断点后仍稳定，GPU 利用率约
+  `98%`、显存 `10452/12288 MiB`（余量约 `1662 MiB`）、温度约 `71°C`，稳态约 `2.8 batch/s`。
+  预计每 epoch 约 19–20 分钟、E100 约 32–34 小时。正式输出为
+  `results/checkpoints/gammatune_E100_feature_w010_b6_s187/`，运行日志为
+  `results/logs/E100_gamma_feature010_b6_s187/gamma_feature_w010.log`。
+
+## 2026-07-27 seed187 Gamma E100：外部中断诊断与 epoch61 恢复
+
+- 中断事实：batch6 长跑在 `2026-07-27 12:43:11` 停于 epoch62、batch2948/3261；最后完整记录与
+  checkpoint 均为 epoch61（`12:25:18`）。日志末尾没有 Traceback、CUDA OOM、KeyboardInterrupt
+  或正常退出标记；Windows 同时段没有重启、休眠、资源耗尽、Python 崩溃或 NVIDIA driver 事件。
+  原进程绑定的 Codex PTY session 3001 已被回收，因此判定为外部终止，而非训练数值或显存故障。
+- 修复（commit `7e397bb`）：`train_masked.py` 新增 `--resume_checkpoint`，恢复 student、EMA teacher
+  与 feature predictor；校验 seed、batch、噪声、loss、OneCycle 等关键配置及 history/checkpoint epoch
+  一致性。旧 checkpoint 未保存 optimizer/scheduler/RNG，因此本次将 OneCycleLR 定位到 epoch61 末，
+  但 AdamW moments 与随机流按确定性新 seed 重新初始化；该不连续性必须在最终结果说明中保留。
+- 后续可靠性：新 checkpoint 开始同时保存 optimizer、scheduler、global step、Python/NumPy/Torch/CUDA、
+  mask、Gamma noise、train/validation DataLoader RNG 状态，后续可在 epoch 边界严格续训。恢复段使用独立
+  `grad_diagnostics_resume_epoch_62.jsonl`，保留原先未完成 epoch62 的诊断记录而不混入重复 step。
+- 启动器：支持 `-ResumeCheckpoint`，日志以 append 方式写入；后台默认 `Progress=0`，不再把每个 batch
+  的 tqdm 输出持续送入终端，避免再次形成约百 MB 的 PTY 输出。正式恢复使用隐藏、独立 PowerShell
+  后台进程，stdout/stderr 单独落盘，不依赖 Codex task 生命周期。
+- 验证：Python 与 PowerShell 语法检查通过；8 个 `unittest` 全部通过，其中新增测试覆盖 OneCycleLR
+  global-step 定位、全部随机状态 round-trip 以及关键配置不匹配拒绝逻辑。
+- 恢复启动：代码版本 `8e72b7d`，隐藏后台 launcher PID=`3332`、Python PID=`40216`；恢复行确认
+  `completed_epoch=61`、`start_epoch=62`、`global_step=198921`、LR=`0.0042623697`。首个新梯度
+  心跳在 epoch62 batch79/global step199000 写入，N2N loss=`0.23619`、weighted feature=`0.01655`；
+  当时 GPU=`99%`、显存=`10991/12288 MiB`、温度=`70°C`，stderr 为空。由此确认模型加载、forward、
+  backward、optimizer 与诊断写入均已实际运行，而非仅停留在初始化阶段。
+
+## 2026-07-28 seed187 Gamma E100：场景 0 前 500 帧 reference 评估
+
+- 评估对象：恢复训练已完整生成 `model_epoch_100.pth`；使用该 checkpoint 对
+  `D:\Desktop\5x5x4\0\npy` 自然排序后的 `0.npy..499.npy` 共 500 帧推理，reference 固定为
+  `D:\Desktop\Robust-N2N\reference.npy`。两者均为 `1208×1352`；推理与正式指标口径为
+  `raw → log1p → model → expm1`，在 raw 域以固定 `data_range=255` 计算 PSNR、skimage MSSIM
+  和 Pearson r，不使用 reference 拟合后的数值替代正式指标。
+- 兼容修复（commit `80c1ae9`）：新 checkpoint 含 NumPy RNG/optimizer/scheduler，PyTorch 2.6+
+  默认 `weights_only=True` 会拒绝加载完整 payload。`utils/checkpoint.py` 对本项目自产 trusted
+  checkpoint 显式使用 `weights_only=False`；83/83 个推理模型参数成功匹配，skipped=0。8 个现有
+  `unittest` 及语法检查通过。
+- 正式 500 帧结果（mean±sample std；min–max）：
+  - PSNR：`33.1013±0.6842 dB`；`27.6314–34.0424 dB`。
+  - MSSIM：`0.86842±0.00440`；`0.8257–0.8756`。
+  - Pearson r：`0.89146±0.00616`；`0.8641–0.9046`。
+  - `per_frame.csv` 复核为 500 行、frame 0–499、500 个唯一帧、无 NaN。
+- 光度诊断（仅诊断）：逐帧拟合 `reference ≈ a·output+b` 后，平均 `a=1.08292`、`b=-1.81143`；
+  output/reference mean ratio=`1.00797`，说明全局均值仅约 `+0.8%`，没有此前那种严重整体亮度漂移；
+  但 std ratio=`0.83301`，表明输出对比度平均压缩约 `16.7%`。reference 拟合后 PSNR 为
+  `33.629 dB`、平均增加 `0.527 dB`，MSSIM=`0.8724`、r=`0.8915`；这些校正值不能作为部署或
+  benchmark 指标。
+- 视觉核验：选择正式 PSNR 最接近 500 帧均值的 frame112（PSNR=`33.1017`、MSSIM=`0.8702`、
+  r=`0.8969`）生成 noisy / denoised / reference 全图及中心 192×192 放大。去噪结果明显抑制散斑，
+  但相对 reference 呈现显著平滑和对比度压缩；局部细血管有变粗、变淡或被抹平的现象。依据项目判据，
+  当前 Gamma 方案不能仅凭平均 PSNR 判定成功。
+- 输出目录：`results/eval_curve/gamma_E100_b6_s187_scene0_first500_reference/`，其中
+  `per_frame.csv` 为正式逐帧结果，`psnr_curve.png` 为 500 帧曲线，
+  `photometric_diagnostic_curve.png`/`photometric_diagnostic_summary.json` 为亮度诊断，
+  `representative_frame_112/comparison_with_zoom.png` 为视觉与局部放大对照。
+
+## 2026-07-28 seed187 Gamma E100：Level1 前 500 帧 OOD reference 评估
+
+- 评估对象与口径：保持上一条的 epoch100 checkpoint、`reference.npy`、raw/log1p/raw 推理流程、
+  `data_range=255` 及 PSNR/skimage MSSIM/Pearson r 完全不变，只把输入替换为用户指定的
+  `D:\Desktop\Robust-N2N\npy`（Level1）自然排序前 500 帧，即 `0.npy..499.npy`。目录共 1000 帧，
+  输入与 reference 均为 `1208×1352`；逐帧 CSV 复核为 500 行、500 个唯一帧、无无效数值。
+- Level1 正式结果（mean±sample std；min–max）：
+  - PSNR：`31.13591±1.56905 dB`；`25.6562–32.8839 dB`。
+  - MSSIM：`0.840195±0.012355`；`0.7883–0.8559`。
+  - Pearson r：`0.858374±0.008646`；`0.8205–0.8756`。
+- 与同 checkpoint 的 Level4 场景 0 前 500 帧相比，Level1 平均 PSNR=`-1.96538 dB`、
+  MSSIM=`-0.028226`、r=`-0.033084`；PSNR 帧间 std 从 `0.6842` 增至 `1.5690 dB`。因此不仅平均质量
+  下降，跨帧稳定性也显著恶化。
+- 光度诊断（仅诊断）：Level1 平均 `a=0.91369`、`b=-0.40172`，output/reference mean
+  ratio=`1.12986`，即输出平均偏亮约 `13.0%`，明显差于 Level4 的 `1.00797`；std ratio=`0.95790`。
+  reference 拟合后 PSNR=`32.551 dB`、平均增加 `1.415 dB`，MSSIM=`0.8516`、r=`0.8584`。
+  校正增益远高于 Level4 的 `0.527 dB`，说明 Level1 误差中包含更强的系统性光度分量；校正值仍不属于
+  正式 benchmark。
+- 视觉核验：选择 Level1 PSNR 最接近总体均值的 frame147（PSNR=`31.1417`、MSSIM=`0.8434`、
+  r=`0.8525`）。输出相对 reference 明显偏亮、背景发灰，细血管被平滑或融合，局部可见 reference
+  中不明显的暗斑/纹理伪影。Gamma corruption 没有消除 Level1 OOD 下的亮度泛化和过平滑问题。
+- 输出目录：`results/eval_curve/gamma_E100_b6_s187_level1_first500_reference/`；正式逐帧结果为
+  `per_frame.csv`，曲线为 `psnr_curve.png` 与 `photometric_diagnostic_curve.png`，代表帧全图和
+  192×192 中心局部放大为 `representative_frame_147/comparison_with_zoom.png`。
+
+## 2026-08-17 Level4 H4基线上的Gamma/Gaussian联合扰动消融
+
+- 目标与选择标准：用户明确本阶段只比较Level4数值，不用Level1泛化指标选择配置。现有seed42、
+  epoch100、scene0前500帧结果中，H4（Gaussian、region ratio=0.25、patch=8）同时取得最高
+  PSNR=`33.307 dB`和SSIM=`0.8697`，因此本轮以H4而非F1作为唯一基线。
+- 新增三组严格对照：J0只使用raw域Gamma；J1保持总扰动区域25%，在patch级以50%概率把已选
+  patch互斥分配给raw-Gamma或log-Gaussian；J2在同一已选patch先施加Gamma再施加Gaussian，
+  两种标准差型强度均乘`1/sqrt(2)`，避免直接叠加导致扰动能量翻倍。三组都固定patch=8、
+  feature weight=0.10、Encoder2+Encoder3、predictor ratio=1、EMA=0.996、feature warmup=10%、
+  RTV=0.01、batch=12、seed42及Level4 scenes 0--29，其余训练参数与H4一致。
+- 实现：`train_masked.py`新增`hybrid_mixture`和`hybrid_sequential`；Gamma、Gaussian与patch类型
+  选择使用相互独立的随机流并写入checkpoint，支持epoch边界严格恢复。联合扰动只进入训练期
+  Student辅助分支；正常N2N分支、EMA Teacher目标与推理网络不变。日志新增实际Gamma patch
+  比例、Gamma CV、Gaussian sigma及raw区域均值变化。
+- 自动流程：`scripts/run_level4_hybrid_ablation.sh`在两张GPU上完成J0/J1并行训练、J2后续训练、
+  三组Level4 scene0前500帧相对H4的配对评测，以及最终CSV/Markdown汇总；
+  `scripts/summarize_level4_hybrid.py`输出PSNR/SSIM/r、相对H4的ΔPSNR和逐帧胜出数。
+- 验证边界：本地只完成不读取实验数据的合成张量单元测试与前后向smoke；没有启动任何正式训练
+  或500帧推理。正式CUDA、数据读取、100 epoch训练和指标验证按用户要求全部在服务器执行，
+  结果尚待回填。
+
+## 2026-08-18 Level4 最优单变量组合验证：K0/K1
+
+- 背景：seed42、epoch100、Level4 scene0前500帧的单变量结果中，W1（feature warmup=20%）取得
+  PSNR=`33.487 dB`、SSIM=`0.8705`；H0（feature weight=0.05）、H4（patch=8）、C0（Gaussian=0）和
+  E1（EMA=0.999）也分别提高了Level4 PSNR。本轮只检验这些设置能否在同一模型中组合，不能把各自增益直接相加。
+- K0：以W1为起点，仅把`feature weight 0.10 -> 0.05`和`patch 16 -> 8`；保留默认局部Gaussian
+  `0.25--0.75 sigma`、EMA=`0.996`、region ratio=`0.25`、Encoder2+Encoder3、RTV=`0.01`。
+- K1：在K0上仅把Gaussian强度改为0、EMA改为`0.999`；零强度Gaussian仍保留25%区域采样、predictor、
+  EMA teacher和区域feature loss，因此不等价于无feature的B1。
+- 公平协议：两组均使用Level4 scenes 0--29、seed42、100 epoch、batch12、crop512、AdamW
+  weight decay=`1e-4`、相同OneCycleLR和同一训练/验证划分；两张GPU各运行一组。推理均只加载单通道student，
+  不使用corruption、predictor、EMA teacher或feature loss。
+- 自动化：`scripts/run_level4_k0_k1.sh`负责噪声统计检查、双GPU并行训练、中断后精确续训、与现有W1在
+  Level4 scene0前500帧上的未校准配对评估；`scripts/summarize_level4_k0_k1.py`生成CSV、Markdown表格和三模型
+  PSNR曲线。正式实验只在服务器运行，结果完成后需补记指标和关键血管区域的视觉结论。
+- 验证边界：本地仅完成shell/Python静态检查、既有corruption/resume单元测试和合成CSV汇总测试；
+  没有读取正式数据，也没有启动训练或500帧推理。正式CUDA训练和评估全部在服务器执行，结果尚待回填。
+
+## 2026-08-19 K0/K1 Level4正式结果
+
+- 评估协议：seed42、epoch100、Level4 scene0前500帧，共用`reference.npy`；所有指标均来自未经仿射校准的
+  原始student输出。500帧来自同一scene，逐帧胜出数只用于场景内稳定性诊断，不能解释为500个独立样本。
+- W1：PSNR=`33.487 dB`、SSIM=`0.8705`、r=`0.8940`。
+- K0：PSNR=`33.196 dB`、SSIM=`0.8663`、r=`0.8924`；相对W1为`-0.291 dB`，仅`75/500`帧胜出。
+  这说明在feature warmup=20%的条件下，同时使用feature weight=0.05与patch=8没有叠加单变量收益。
+- K1：PSNR=`32.987 dB`、SSIM=`0.8646`、r=`0.8884`；相对W1为`-0.500 dB`，仅`18/500`帧胜出；
+  相对K0仍为`-0.209 dB`，胜出`112/500`帧。Gaussian=0与EMA=0.999在K0配置上的联合改动进一步退化，
+  但因为两项同时变化，不能仅凭K1把退化单独归因于Gaussian或EMA。
+- 决策：当前Level4数值最优配置继续保留W1，不采用K0或K1；单变量改进不能直接相加，后续不再依据单次
+  表格排名盲目堆叠参数。结果位于`results/eval_paper/level4_K0_K1_E100_v1/`，包括CSV、Markdown与
+  `K0_K1_vs_W1_s42_psnr_curve.png`。本次尚未收到三组去噪图与loss曲线的视觉检查结果，因此这里只确认
+  定量排名，不对退化的具体图像机制或收敛过程作结论。

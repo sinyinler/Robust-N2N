@@ -16,9 +16,14 @@ def unwrap_state_dict(payload):
 
 
 def load_weights_flexible(model: torch.nn.Module, checkpoint_path: str, device: torch.device) -> dict[str, int]:
-    """尽量加载能匹配的权重，便于复用旧 N2N checkpoint。"""
+    """尽量加载能匹配的权重，便于复用本项目生成的 trusted checkpoint。
 
-    payload = torch.load(checkpoint_path, map_location=device)
+    PyTorch 2.6 起 ``torch.load`` 默认启用 ``weights_only=True``。完整训练
+    checkpoint 还包含 NumPy RNG、optimizer 与 scheduler 状态，因此需要显式
+    关闭 weights-only 模式；不要将此入口用于来源不可信的 checkpoint。
+    """
+
+    payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = unwrap_state_dict(payload)
     state_dict = {key.replace("module.", ""): value for key, value in state_dict.items()}
     model_state = model.state_dict()

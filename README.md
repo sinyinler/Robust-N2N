@@ -125,3 +125,56 @@ python eval.py `
 
 `experiment_log.md` 必须记录每次实验的配置、checkpoint、指标和视觉判断。
 去噪任务不能只看 PSNR/SSIM；需要同时检查血管结构是否光滑、细小血管是否被磨平。
+# SIDD sRGB 监督基线（独立路径）
+
+SIDD 代码不会修改原 BFI/N2N 的单通道数据和模型路径。默认实验使用
+SIDD-Small 的 scene-disjoint 划分：训练 `001-006,009,010`（120 对），
+验证 `007`（20 对），内部测试 `008`（20 对）。输入和目标分别是
+`NOISY_SRGB_010.PNG` 与 `GT_SRGB_010.PNG`，直接归一化到 `[0,1]`，不使用
+`log1p/expm1`、RTV 或 feature loss。
+
+本机已配置的 Conda 环境运行方式：
+
+```powershell
+# GPU/data/反向传播 smoke（只跑 2 step，写入独立输出目录）
+D:\Anaconda\envs\denoise\python.exe train_sidd.py `
+  --config configs/sidd_supervised.json `
+  --epochs 1 --smoke_steps 2 `
+  --out_dir results/sidd/smoke_s42
+
+# 20 epoch 监督基线
+D:\Anaconda\envs\denoise\python.exe train_sidd.py `
+  --config configs/sidd_supervised.json
+
+# scene 008 完整图 tiled inference（512 tile / 64 overlap）
+D:\Anaconda\envs\denoise\python.exe eval_sidd.py `
+  --data_root "D:\Desktop\数据集\SIDD\SIDD_Small_sRGB_Only" `
+  --checkpoint results/sidd/supervised_charbonnier_s42/best.pt `
+  --scenes 008 `
+  --out_dir results/sidd/internal_test_scene008
+```
+
+公开 SIDD Validation blocks 的本地评测：
+
+```powershell
+# 无 checkpoint 时先计算 noisy baseline，并核验 MAT 变量和维度
+D:\Anaconda\envs\denoise\python.exe eval_sidd_blocks.py `
+  --noisy_mat "D:\Desktop\数据集\SIDD\Validation\ValidationNoisyBlocksSrgb.mat" `
+  --gt_mat "D:\Desktop\数据集\SIDD\Validation\ValidationGtBlocksSrgb.mat" `
+  --out_dir results/sidd/validation_noisy_baseline
+
+# 训练后计算模型结果；--save_mat 可额外生成 Idenoised.mat
+D:\Anaconda\envs\denoise\python.exe eval_sidd_blocks.py `
+  --noisy_mat "D:\Desktop\数据集\SIDD\Validation\ValidationNoisyBlocksSrgb.mat" `
+  --gt_mat "D:\Desktop\数据集\SIDD\Validation\ValidationGtBlocksSrgb.mat" `
+  --checkpoint results/sidd/supervised_charbonnier_s42/best.pt `
+  --out_dir results/sidd/validation_trained --save_mat
+```
+
+主要文件：
+
+- `data/sidd_dataset.py`：RGB pair 发现、scene 过滤、同步 crop/增强；
+- `models/sidd_rgb_denoiser.py`：不压灰度的 3→3 通道轻量 U-Net；
+- `train_sidd.py`：纯 Charbonnier 监督训练与 best/last checkpoint；
+- `eval_sidd.py`：内部完整图 tiled inference、逐图指标和可视化；
+- `eval_sidd_blocks.py`：公开 Validation MAT 的 1280-block 标准评测。
